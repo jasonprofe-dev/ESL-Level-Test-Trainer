@@ -1,0 +1,6 @@
+Replace ONLY these three files in the repository root:
+- index.html
+- app.js
+- sw.js
+
+All other existing root files stay unchanged.

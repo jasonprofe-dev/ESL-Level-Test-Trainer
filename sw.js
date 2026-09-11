@@ -1,5 +1,5 @@
-const CACHE='cefr-trainer-local-v04-shell';
-const SHELL=['./','./index.html','./app.css','./js/app.js','./js/levels.js','./js/prompts.js','./workers/llm-worker.js','./workers/whisper-worker.js','./workers/tts-worker.js','./manifest.webmanifest'];
+const CACHE='cefr-trainer-local-v04b-shell';
+const SHELL=['./','./index.html','./app.css','./app.js','./levels.js','./prompts.js','./llm-worker.js','./whisper-worker.js','./tts-worker.js','./manifest.webmanifest'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)).then(()=>self.skipWaiting())));
 self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',event=>{

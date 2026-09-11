@@ -77,7 +77,7 @@ function hardware() {
 
 function initLLMWorker() {
   if (llmWorker) return;
-  llmWorker = new Worker('./workers/llm-worker.js', { type: 'module' });
+  llmWorker = new Worker('./llm-worker.js', { type: 'module' });
   llmWorker.addEventListener('message', (e) => {
     const d = e.data || {};
     if (d.type === 'progress') {
@@ -101,7 +101,7 @@ function initLLMWorker() {
 
 function initWhisperWorker() {
   if (whisperWorker) return;
-  whisperWorker = new Worker('./workers/whisper-worker.js', { type: 'module' });
+  whisperWorker = new Worker('./whisper-worker.js', { type: 'module' });
   whisperWorker.addEventListener('message', (e) => {
     const d=e.data||{};
     if (d.type==='progress') { state.whisperStatus=d.text || 'Loading Whisper…'; render(); return; }
@@ -114,7 +114,7 @@ function initWhisperWorker() {
 
 function initTTSWorker() {
   if (ttsWorker) return;
-  ttsWorker = new Worker('./workers/tts-worker.js', { type: 'module' });
+  ttsWorker = new Worker('./tts-worker.js', { type: 'module' });
   ttsWorker.addEventListener('message', (e) => {
     const d=e.data||{};
     if(d.type==='progress'){ state.ttsStatus=d.text||'Loading local voice…'; render(); return; }
