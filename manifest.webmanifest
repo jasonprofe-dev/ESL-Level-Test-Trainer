@@ -1,0 +1,9 @@
+{
+  "name": "CEFR Tester Trainer — Local Edition",
+  "short_name": "CEFR Trainer",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f4f7fb",
+  "theme_color": "#142a4c",
+  "description": "Private, local CEFR English level-tester training simulator."
+}
