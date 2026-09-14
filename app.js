@@ -1,5 +1,6 @@
 import { LEVELS, createRandomLearner, levelIndex } from './levels.js';
 import { learnerInstructions } from './prompts.js';
+import * as webllm from 'https://esm.run/@mlc-ai/web-llm@0.2.85';
 
 const app = document.querySelector('#app');
 
@@ -52,11 +53,11 @@ const state = {
   info: '',
 };
 
-let llmWorker;
+let llmEngine = null;
+let currentLLMModel = null;
 let whisperWorker;
 let ttsWorker;
 let requestCounter = 0;
-const llmWaiters = new Map();
 const whisperWaiters = new Map();
 const ttsWaiters = new Map();
 let currentAudio = null;
@@ -75,28 +76,63 @@ function hardware() {
   };
 }
 
-function initLLMWorker() {
-  if (llmWorker) return;
-  llmWorker = new Worker('./llm-worker.js', { type: 'module' });
-  llmWorker.addEventListener('message', (e) => {
-    const d = e.data || {};
-    if (d.type === 'progress') {
-      state.llmStatus = d.text || 'Loading local language model…';
-      if (Number.isFinite(d.progress)) state.llmProgress = clamp(d.progress,0,1);
-      render(); return;
+async function resolveCompatibleModel(modelId) {
+  if (!navigator.gpu) throw new Error('WebGPU is not available in this browser.');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error('Chrome exposes WebGPU, but no GPU adapter is available in the main browser context.');
+  }
+  const hasF16 = adapter.features?.has?.('shader-f16');
+  let effectiveModel = modelId;
+  if (!hasF16 && /q4f16_1/.test(modelId)) {
+    effectiveModel = modelId.replace('q4f16_1', 'q4f32_1');
+  }
+  return { adapter, hasF16, effectiveModel };
+}
+
+async function loadLLM(modelId) {
+  state.error=''; state.llmReady=false; state.llmLoading=true; state.llmProgress=0;
+  state.llmStatus='Checking the main-browser GPU adapter…'; render();
+  try {
+    const { hasF16, effectiveModel } = await resolveCompatibleModel(modelId);
+    if (llmEngine && currentLLMModel !== effectiveModel) {
+      try { await llmEngine.unload?.(); } catch { /* ignore */ }
+      llmEngine = null;
     }
-    if (d.type === 'ready') {
-      state.llmReady = true; state.llmLoading = false; state.llmProgress = 1;
-      state.llmStatus = `Ready · ${d.modelId || state.selectedModel}`; render(); return;
-    }
-    if (d.type === 'generated' || d.type === 'error') {
-      const waiter = llmWaiters.get(d.requestId);
-      if (waiter) { llmWaiters.delete(d.requestId); d.type === 'error' ? waiter.reject(new Error(d.message)) : waiter.resolve(d.text); }
-    }
-    if (d.type === 'error' && !d.requestId) {
-      state.llmLoading = false; state.error = d.message || 'Local model error.'; render();
-    }
+    currentLLMModel = effectiveModel;
+    state.llmStatus = effectiveModel === modelId
+      ? 'GPU adapter ready · starting model download / cache check…'
+      : `GPU adapter ready · shader-f16 unavailable, using compatible ${effectiveModel.replace('-MLC','')}…`;
+    render();
+    llmEngine = await webllm.CreateMLCEngine(effectiveModel, {
+      initProgressCallback(report) {
+        state.llmStatus = report.text || 'Loading local language model…';
+        if (Number.isFinite(report.progress)) state.llmProgress = clamp(report.progress, 0, 1);
+        render();
+      },
+      logLevel: 'WARN',
+    });
+    state.llmReady=true; state.llmLoading=false; state.llmProgress=1;
+    state.llmStatus=`Ready · ${effectiveModel}${hasF16 ? '' : ' · compatibility mode'}`;
+    state.info='Local learner AI is running on the main browser thread because this device does not expose a WebGPU adapter inside workers.';
+    render();
+  } catch (error) {
+    state.llmReady=false; state.llmLoading=false;
+    state.error=error?.message || String(error);
+    render();
+  }
+}
+
+async function generate(messages, { maxTokens=220, temperature=.72 }={}) {
+  if (!llmEngine) throw new Error('Local language model is not loaded.');
+  const response = await llmEngine.chat.completions.create({
+    messages: messages || [],
+    temperature,
+    top_p: .92,
+    max_tokens: maxTokens,
+    frequency_penalty: .15,
   });
+  return response?.choices?.[0]?.message?.content?.trim() || '';
 }
 
 function initWhisperWorker() {
@@ -122,21 +158,6 @@ function initTTSWorker() {
     if(d.type==='audio'||d.type==='error'){
       const w=ttsWaiters.get(d.requestId); if(w){ttsWaiters.delete(d.requestId); d.type==='error'?w.reject(new Error(d.message)):w.resolve(d.blob);}
     }
-  });
-}
-
-function loadLLM(modelId) {
-  initLLMWorker();
-  state.error=''; state.llmReady=false; state.llmLoading=true; state.llmProgress=0; state.llmStatus='Starting model download / cache check…'; render();
-  llmWorker.postMessage({ type:'load', modelId });
-}
-
-function generate(messages, { maxTokens=220, temperature=.72 }={}) {
-  initLLMWorker();
-  const requestId=uid('llm');
-  return new Promise((resolve,reject)=>{
-    llmWaiters.set(requestId,{resolve,reject});
-    llmWorker.postMessage({type:'generate',requestId,messages,maxTokens,temperature});
   });
 }
 
@@ -468,7 +489,7 @@ function scoreHtml(label,value){return `<div class="score"><span class="small">$
 
 function chrome(){
   const h=hardware();
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Local Edition v0.4</small></div></div><div class="pills"><span class="pill ${state.llmReady?'ok':''}">${state.llmReady?'● Local AI ready':'○ Local AI'}</span><span class="pill ${h.webgpu?'ok':'warn'}">${h.webgpu?'WebGPU':'WebGPU unavailable'}</span><span class="pill ok">No API key</span></div></header>${state.error?`<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>`:''}${state.info?`<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>`:''}${state.stage==='setup'?setupView():state.stage==='interview'?interviewView():state.stage==='guess'?guessView():resultsView()}<div class="footerNote">Local Edition: model files are downloaded from public model/CDN hosts on first use; interview prompts are not sent to a paid model API.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Local Edition v0.4c</small></div></div><div class="pills"><span class="pill ${state.llmReady?'ok':''}">${state.llmReady?'● Local AI ready':'○ Local AI'}</span><span class="pill ${h.webgpu?'ok':'warn'}">${h.webgpu?'WebGPU':'WebGPU unavailable'}</span><span class="pill ok">No API key</span></div></header>${state.error?`<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>`:''}${state.info?`<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>`:''}${state.stage==='setup'?setupView():state.stage==='interview'?interviewView():state.stage==='guess'?guessView():resultsView()}<div class="footerNote">Local Edition: model files are downloaded from public model/CDN hosts on first use; interview prompts are not sent to a paid model API.</div></div>`;
 }
 
 function render(){app.innerHTML=chrome(); bind();}
