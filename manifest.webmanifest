@@ -1,9 +1,9 @@
 {
-  "name": "CEFR Tester Trainer — Lower-Level Fidelity Engine",
+  "name": "CEFR Tester Trainer — European ESL Naturalness Engine",
   "short_name": "CEFR Trainer",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#f3f6fa",
   "theme_color": "#142a4c",
-  "description": "Browser-only CEFR tester training client with hard lower-band CEFR gates, persistent spoken learner limitations, robust speech retry and low-latency chunked learner voice."
+  "description": "Browser-only CEFR tester trainer with Cambridge-anchored European ESL personas, natural lower-band limitations, robust speech retry and quality-first server AI."
 }

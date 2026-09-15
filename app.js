@@ -127,9 +127,10 @@ async function checkServer({ quiet = false } = {}) {
     state.voiceReady = !!data.voice_ready;
     state.learnerReady = !!data.ready;
     state.warmServices = data.services || {};
-    state.serverStatus = state.textReady ? `Connected · ${data.model || 'AI service ready'}` : 'Server reachable · learner model warming';
-    state.sttStatus = state.speechReady ? `Server speech recognition · ${data.whisper || 'Whisper'} ready` : `Server speech recognition · ${data.whisper || 'Whisper'} warming`;
-    state.ttsStatus = state.voiceReady ? `Server learner voice · ${data.tts || 'Kokoro'} ready` : `Server learner voice · ${data.tts || 'Kokoro'} warming`;
+    const anyWarming = Object.values(state.warmServices).some(s => s?.status === 'warming');
+    state.serverStatus = state.textReady ? `Connected · ${data.model || 'AI service ready'}` : (anyWarming ? 'Server reachable · learner model warming' : 'Server reachable · AI starts when you select a learner');
+    state.sttStatus = state.speechReady ? `Server speech recognition · ${data.whisper || 'Whisper'} ready` : (anyWarming ? `Server speech recognition · ${data.whisper || 'Whisper'} warming` : `Server speech recognition · ${data.whisper || 'Whisper'} starts with interview`);
+    state.ttsStatus = state.voiceReady ? `Server learner voice · ${data.tts || 'Kokoro'} ready` : (anyWarming ? `Server learner voice · ${data.tts || 'Kokoro'} warming` : `Server learner voice · ${data.tts || 'Kokoro'} starts with interview`);
     if (state.token) await verifyToken({ quiet: true });
     if (!quiet) render();
     return true;
@@ -150,7 +151,6 @@ async function verifyToken({ quiet = false } = {}) {
     const res = await apiFetch('/api/me', { headers: authHeaders() });
     if (!res.ok) throw new Error(await parseApiError(res));
     state.authenticated = true;
-    apiFetch('/api/warm', { method: 'POST', headers: authHeaders() }).catch(() => {});
     if (!quiet) render();
     return true;
   } catch {
@@ -183,9 +183,8 @@ async function authenticate() {
     state.authenticated = true;
     state.accessCode = '';
     state.info = 'Connected securely to the Modal training server.';
-    // Start the expensive learner model warming immediately after sign-in. This is
-    // fire-and-forget; the browser never waits on the cold-start HTTP request.
-    apiFetch('/api/warm', { method: 'POST', headers: authHeaders() }).catch(() => {});
+    // v0.13 cost control: signing in does not start a GPU. Services warm only
+    // when the trainer actually starts a learner interview.
   } catch (e) {
     state.error = `Could not sign in: ${e.message}`;
   } finally {
@@ -1039,7 +1038,7 @@ function setupView() {
       <div class="notice blue">For organisational deployment, server hosting, retention policy and access controls should be approved before broad staff rollout.</div>
     </section>
     <section class="card span12">
-      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age and learner persona.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !state.serverConnected || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
+      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age, European ESL background and learner persona. GPU services warm only when you start an interview to reduce Modal spend.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !state.serverConnected || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
     </section>
   </div>`;
 }
@@ -1051,7 +1050,7 @@ function interviewView() {
     ? `<button class="btn ${state.liveListening ? 'danger' : 'primary'}" id="liveToggle" ${!state.speechReady ? 'disabled' : ''}>${state.liveListening ? '■ Pause live listening' : '🎙️ Start live conversation'}</button><span class="badge">${state.speaking ? 'Learner speaking' : state.busy ? 'Learner thinking' : state.speechDetected ? 'Hearing you…' : state.liveListening ? 'Listening' : 'Paused'}</span>`
     : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.speechReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
   return `<div class="grid"><section class="card span12">
-    <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
+    <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · ${escapeHtml([l.city,l.country].filter(Boolean).join(', '))} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
     <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
     <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><div class="btnRow"><button class="btn ghost" id="stopAudio">Stop learner audio</button>${state.pendingVoiceText ? `<button class="btn secondary" id="retryVoice">Retry learner voice</button>` : ''}</div><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
@@ -1086,7 +1085,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Lower-Level Fidelity Engine v0.12.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>European ESL Naturalness Engine v0.13.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
