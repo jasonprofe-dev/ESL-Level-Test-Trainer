@@ -58,6 +58,10 @@ const state = {
   lastSttMs: null,
   lastSttSecondPass: false,
   lastTtsMs: null,
+  lastTtsTotalMs: null,
+  pendingAudioBlob: null,
+  pendingAudioMime: '',
+  pendingAudioLabel: '',
   lastTurnTiming: null,
   error: '',
   info: '',
@@ -70,6 +74,7 @@ let vadAnalyser = null;
 let vadRaf = null;
 let cancelCurrentUtterance = false;
 let warmPollTimer = null;
+let speechPlaybackToken = 0;
 
 function escapeHtml(value = '') { return String(value).replace(/[&<>'"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;' }[c])); }
 function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
@@ -77,6 +82,7 @@ function formatClock(ms) { const s=Math.floor(ms/1000); return `${String(Math.fl
 function apiConfigured() { return ((/^https:\/\//i.test(API_BASE)) || (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(API_BASE))) && !API_BASE.includes('YOUR-SERVER'); }
 function hardware() { return { secure: window.isSecureContext, mic: !!navigator.mediaDevices?.getUserMedia, recorder: 'MediaRecorder' in window }; }
 function authHeaders(extra = {}) { return state.token ? { ...extra, Authorization: `Bearer ${state.token}` } : extra; }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function parseApiError(res) {
   let detail = '';
@@ -217,6 +223,9 @@ async function startInterview() {
     state.warmStartedAt = Date.now();
     state.transcript = [];
     state.input = '';
+    state.pendingAudioBlob = null;
+    state.pendingAudioMime = '';
+    state.pendingAudioLabel = '';
     state.results = null;
     state.reveal = null;
     state.guess = 'B1.2';
@@ -333,6 +342,9 @@ async function askLearner(question) {
   if (!state.textReady) { state.error = 'The learner AI is still preparing. Wait for AI ✓.'; render(); return; }
   state.error = '';
   state.input = '';
+  state.pendingAudioBlob = null;
+  state.pendingAudioMime = '';
+  state.pendingAudioLabel = '';
   state.transcript.push({ role: 'tester', text: q, at: Date.now() });
   state.busy = true;
   state.sttStatus = state.liveListening ? 'Central AI is preparing the learner response…' : state.sttStatus;
@@ -347,8 +359,9 @@ async function askLearner(question) {
     if (!res.ok) throw new Error(await parseApiError(res));
     const data = await res.json();
     const reply = String(data.reply || '').trim() || "Sorry, I'm not sure what to say.";
-    const aiMs = Number(data.timings?.total_ai_ms || (performance.now() - aiStarted));
-    state.lastTurnTiming = { sttMs: state.lastSttMs, aiMs, rewritten: !!data.rewritten };
+    const serverAiMs = Number(data.timings?.total_ai_ms || 0);
+    const aiMs = performance.now() - aiStarted;
+    state.lastTurnTiming = { sttMs: state.lastSttMs, aiMs, serverAiMs, rewritten: !!data.rewritten };
     state.transcript.push({ role: 'learner', text: reply, at: Date.now() });
     state.busy = false;
     render(); scrollChat();
@@ -363,29 +376,65 @@ async function askLearner(question) {
 }
 
 async function transcribeServer(blob, mimeType = 'audio/webm') {
-  const form = new FormData();
+  const wallStarted = performance.now();
   const ext = /ogg/i.test(mimeType) ? 'ogg' : 'webm';
-  form.append('audio', blob, `utterance.${ext}`);
-  state.sttStatus = 'Transcribing on the Modal server…';
-  render();
-  const res = await apiFetch('/api/transcribe', { method: 'POST', headers: authHeaders(), body: form });
-  if (!res.ok) throw new Error(await parseApiError(res));
-  const data = await res.json();
-  return {
-    text: String(data.text || '').trim(),
-    needsRetry: !!data.needs_retry,
-    retryReason: String(data.retry_reason || ''),
-    durationSeconds: Number(data.duration_seconds || 0),
-    processingMs: Number(data.processing_ms || 0),
-    automaticSecondPass: !!data.automatic_second_pass,
-  };
+  let clientRetry = false;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const form = new FormData();
+      // Rebuild FormData for each attempt so the exact same captured audio can be
+      // retried safely after a transient browser/network failure.
+      form.append('audio', blob, `utterance.${ext}`);
+      state.sttStatus = attempt
+        ? 'Connection interrupted — retrying the same recording once…'
+        : 'Transcribing on the Modal server…';
+      render();
+      const res = await apiFetch('/api/transcribe', { method: 'POST', headers: authHeaders(), body: form });
+      if (!res.ok) {
+        const message = await parseApiError(res);
+        if (attempt === 0 && [502, 503, 504].includes(res.status)) {
+          clientRetry = true;
+          await sleep(450);
+          continue;
+        }
+        throw new Error(message);
+      }
+      const data = await res.json();
+      return {
+        text: String(data.text || '').trim(),
+        needsRetry: !!data.needs_retry,
+        retryReason: String(data.retry_reason || ''),
+        durationSeconds: Number(data.duration_seconds || 0),
+        processingMs: Number(data.processing_ms || 0),
+        wallMs: performance.now() - wallStarted,
+        automaticSecondPass: !!data.automatic_second_pass,
+        clientRetry,
+      };
+    } catch (e) {
+      lastError = e;
+      const msg = String(e?.message || e || '');
+      const transient = /failed to fetch|network|load failed|connection|fetch/i.test(msg) || e instanceof TypeError;
+      if (attempt === 0 && transient) {
+        clientRetry = true;
+        await sleep(450);
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastError || new Error('Speech recognition request failed.');
 }
 
-async function synthesizeServer(text) {
+async function synthesizeServer(text, { quiet = false } = {}) {
+  const wallStarted = performance.now();
   const style = VOICE_STYLES.find(v => v.id === state.selectedVoiceStyle) || VOICE_STYLES[0];
   const voice = state.learner?.gender === 'boy' ? style.boy : style.girl;
-  state.ttsStatus = 'Generating the same learner voice on Modal…';
-  render();
+  if (!quiet) {
+    state.ttsStatus = 'Generating the same learner voice on Modal…';
+    render();
+  }
   const path = state.sessionId ? `/api/session/${encodeURIComponent(state.sessionId)}/tts` : '/api/tts';
   const res = await apiFetch(path, {
     method: 'POST',
@@ -394,11 +443,72 @@ async function synthesizeServer(text) {
   });
   if (!res.ok) throw new Error(await parseApiError(res));
   const processingMs = Number(res.headers.get('X-Processing-Ms') || 0);
-  return { blob: await res.blob(), processingMs };
+  const blob = await res.blob();
+  return { blob, processingMs, wallMs: performance.now() - wallStarted };
+}
+
+function splitSpeechChunks(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return [];
+  const sentences = raw.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [raw];
+  const chunks = [];
+  for (const sentenceRaw of sentences) {
+    const sentence = sentenceRaw.trim();
+    if (!sentence) continue;
+    if (sentence.length <= 175) {
+      chunks.push(sentence);
+      continue;
+    }
+    // A very long sentence delays first audio. Split only at natural comma/semicolon
+    // boundaries; never invent or remove learner wording.
+    const pieces = sentence.split(/(?<=[,;:])\s+/);
+    let current = '';
+    for (const piece of pieces) {
+      const candidate = current ? `${current} ${piece}` : piece;
+      if (current && candidate.length > 155) {
+        chunks.push(current.trim());
+        current = piece;
+      } else {
+        current = candidate;
+      }
+    }
+    if (current.trim()) chunks.push(current.trim());
+  }
+  if (chunks.length > 1 && chunks[0].length < 45 && `${chunks[0]} ${chunks[1]}`.length <= 175) {
+    chunks.splice(0, 2, `${chunks[0]} ${chunks[1]}`);
+  }
+  return chunks.length ? chunks : [raw];
+}
+
+async function playAudioBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  await new Promise((resolve, reject) => {
+    const audio = new Audio(url);
+    currentAudio = audio;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
+      resolve();
+    };
+    audio.onended = finish;
+    audio.onpause = finish;
+    audio.onerror = () => {
+      if (done) return;
+      done = true;
+      URL.revokeObjectURL(url);
+      if (currentAudio === audio) currentAudio = null;
+      reject(new Error('Audio playback failed.'));
+    };
+    audio.play().catch(reject);
+  });
 }
 
 async function speak(text) {
   if (!text || state.voiceMode === 'off') return;
+  const myPlaybackToken = ++speechPlaybackToken;
   state.speaking = true;
   render();
   if (currentAudio) { try { currentAudio.pause(); } catch {} currentAudio = null; }
@@ -418,18 +528,37 @@ async function speak(text) {
       state.ttsStatus = 'Learner voice is still warming; text shown without substituting a different voice.';
       return;
     }
-    const result = await synthesizeServer(text);
-    state.lastTtsMs = result.processingMs || null;
-    const url = URL.createObjectURL(result.blob);
-    await new Promise((resolve, reject) => {
-      currentAudio = new Audio(url);
-      currentAudio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; resolve(); };
-      currentAudio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; reject(new Error('Audio playback failed.')); };
-      currentAudio.play().catch(reject);
-    });
-    state.ttsStatus = state.lastTtsMs ? `Kokoro ready · last voice ${(state.lastTtsMs / 1000).toFixed(1)}s` : `Ready · ${state.serverHealth?.tts || 'central Kokoro'}`;
+
+    const chunks = splitSpeechChunks(text);
+    state.ttsStatus = 'Preparing first learner-voice chunk…';
+    render();
+
+    let currentResult = await synthesizeServer(chunks[0]);
+    state.lastTtsMs = currentResult.wallMs || currentResult.processingMs || null; // actual time to first playable chunk
+    let totalGenerationMs = Number(currentResult.processingMs || 0);
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (myPlaybackToken !== speechPlaybackToken) break;
+      // While the current chunk is playing, synthesize the next one on the same
+      // warm Kokoro service. This hides most later TTS latency behind playback.
+      const nextPromise = i + 1 < chunks.length ? synthesizeServer(chunks[i + 1], { quiet: true }) : null;
+      state.ttsStatus = i === 0
+        ? `Learner voice started${state.lastTtsMs ? ` after ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}`
+        : 'Learner voice playing';
+      render();
+      await playAudioBlob(currentResult.blob);
+      if (myPlaybackToken !== speechPlaybackToken) break;
+      if (nextPromise) {
+        currentResult = await nextPromise;
+        totalGenerationMs += Number(currentResult.processingMs || 0);
+      }
+    }
+    state.lastTtsTotalMs = totalGenerationMs || null;
+    state.ttsStatus = state.lastTtsMs
+      ? `Kokoro ready · first audio ${(state.lastTtsMs / 1000).toFixed(1)}s`
+      : `Ready · ${state.serverHealth?.tts || 'central Kokoro'}`;
   } catch (e) {
-    // Never silently change Adam/Mia to a completely different browser voice.
+    // Never silently change the learner to a completely different browser voice.
     state.ttsStatus = 'Central learner voice failed for this turn';
     state.error = `Learner voice error: ${e.message}. The written answer is still valid; no substitute voice was used.`;
   } finally {
@@ -497,27 +626,36 @@ function stopPushToTalk() {
   try { state.utteranceRecorder.stop(); } catch {}
 }
 
-async function processUtterance(chunks, mimeType) {
+async function processAudioBlob(blob, mimeType, { retainedRetry = false } = {}) {
   try {
-    const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
     const result = await transcribeServer(blob, mimeType);
-    state.lastSttMs = result.processingMs || null;
+    state.lastSttMs = result.wallMs || result.processingMs || null;
     state.lastSttSecondPass = !!result.automaticSecondPass;
-    state.sttStatus = result.processingMs
-      ? `Whisper finished in ${(result.processingMs / 1000).toFixed(1)}s${result.automaticSecondPass ? ' · automatic accuracy retry used' : ''}`
+    state.sttStatus = (result.wallMs || result.processingMs)
+      ? `Whisper turn ${(Number(result.wallMs || result.processingMs) / 1000).toFixed(1)}s${result.automaticSecondPass ? ' · accuracy retry used' : ''}${result.clientRetry ? ' · connection retry recovered' : ''}`
       : (state.liveListening ? 'Live listening ready' : `Ready · ${state.serverHealth?.whisper || 'central Whisper'}`);
     render();
+
     if (result.needsRetry) {
+      // Retain the exact recording so the user does not have to repeat the question.
+      state.pendingAudioBlob = blob;
+      state.pendingAudioMime = mimeType || 'audio/webm';
+      state.pendingAudioLabel = result.text ? `I heard: “${result.text}”` : 'Whisper was uncertain';
       state.input = result.text;
       state.info = result.text
-        ? `Speech recognition was uncertain and was NOT sent to the learner. I heard: “${result.text}”. Edit it and press Ask, or try the microphone again.`
-        : 'Speech recognition was uncertain and nothing was sent to the learner. Please try the microphone again or type the question.';
+        ? `Speech recognition was uncertain and was NOT sent to the learner. I heard: “${result.text}”. You can edit it and press Ask, or retry the SAME recording.`
+        : 'Speech recognition was uncertain and nothing was sent to the learner. You can retry the SAME recording or type the question.';
       if (state.liveListening) stopLiveListening({ keepMic: true });
       render();
       return;
     }
+
+    state.pendingAudioBlob = null;
+    state.pendingAudioMime = '';
+    state.pendingAudioLabel = '';
     if (result.text) {
       state.input = result.text;
+      state.info = retainedRetry ? 'Retained recording transcribed successfully.' : '';
       render();
       await askLearner(result.text);
     } else {
@@ -526,10 +664,33 @@ async function processUtterance(chunks, mimeType) {
       if (state.liveListening) setTimeout(beginVadCycle, 300);
     }
   } catch (e) {
+    // A browser/network failure must not throw away the tester's audio. Keep it in
+    // memory and give an explicit retry button; live listening pauses to prevent a
+    // second turn being recorded on top of the unresolved one.
+    state.pendingAudioBlob = blob;
+    state.pendingAudioMime = mimeType || 'audio/webm';
+    state.pendingAudioLabel = 'Connection/transcription request failed';
+    if (state.liveListening) stopLiveListening({ keepMic: true });
     state.error = `Central transcription error: ${e.message}`;
+    state.info = 'Your last recording has been retained in this browser. Use “Retry last transcription” — you do not need to say the question again.';
     render();
-    if (state.liveListening) setTimeout(beginVadCycle, 500);
   }
+}
+
+async function processUtterance(chunks, mimeType) {
+  const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
+  await processAudioBlob(blob, mimeType || 'audio/webm');
+}
+
+async function retryPendingTranscription() {
+  if (!state.pendingAudioBlob || state.busy || state.speaking) return;
+  const blob = state.pendingAudioBlob;
+  const mime = state.pendingAudioMime || blob.type || 'audio/webm';
+  state.error = '';
+  state.info = 'Retrying the retained recording…';
+  state.sttStatus = 'Retrying retained audio on Whisper…';
+  render();
+  await processAudioBlob(blob, mime, { retainedRetry: true });
 }
 
 async function startLiveListening() {
@@ -702,7 +863,18 @@ function analyzeInterview(actualLevel) {
     extended: /tell me about|describe|explain|what happened|how did/.test(all),
   };
   const coverageCount = Object.values(coverage).filter(Boolean).length;
-  const followUps = tester.filter(q => /\bwhy\b|\bhow\b|tell me more|what happened next|what do you mean|can you explain|you said|what about/i.test(q)).length;
+  const followStop = new Set(['about','after','again','because','could','doing','great','have','little','more','really','tell','that','their','there','these','thing','think','this','what','when','where','which','would','your','yourself','weekend','school']);
+  const contentWords = text => new Set(String(text || '').toLowerCase().match(/[a-z']{4,}/g)?.filter(w => !followStop.has(w)) || []);
+  let followUps = 0;
+  for (let i = 1; i < tester.length; i += 1) {
+    const q = tester[i];
+    const prior = learner[i - 1] || '';
+    const explicitReference = /you (?:said|mentioned|told me)|you were saying|earlier you|tell me more about/i.test(q);
+    const qWords = contentWords(q);
+    const priorWords = contentWords(prior);
+    const overlap = [...qWords].filter(w => priorWords.has(w));
+    if (explicitReference || overlap.length >= 1 || /what happened next|why was that|how did that make you feel/i.test(q)) followUps += 1;
+  }
   const longQs = tester.filter(q => q.trim().split(/\s+/).length > 24).length;
   const multiQs = tester.filter(q => (q.match(/\?/g) || []).length > 2).length;
   const misunderstand = learner.filter(x => /sorry|don't understand|do you mean|what does|what mean|could you repeat/i.test(x)).length;
@@ -721,8 +893,9 @@ function analyzeInterview(actualLevel) {
   const strengths = [];
   const developments = [];
   if (scores.clarity >= 8) strengths.push('Questions were generally concise and easy to process.'); else developments.push('Shorten or split some questions so processing difficulty does not obscure language level.');
-  if (scores.followUp >= 7) strengths.push('You used follow-up questions to move beyond rehearsed answers.'); else developments.push('Use more “why/how/tell me more” follow-ups after the learner’s first answer.');
+  if (scores.followUp >= 7) strengths.push('You used genuinely responsive follow-up questions linked to something the learner had just said.'); else developments.push('Add a genuinely responsive follow-up based on the learner’s own answer, not only the next planned diagnostic question.');
   if (scores.discrimination >= 8) strengths.push('You sampled several language functions that help distinguish adjacent bands.'); else developments.push('Probe more than familiar description: include past, future, opinion, comparison and an age-appropriate hypothetical.');
+  if (coverageCount >= 3 && scores.followUp < 7) strengths.push('You broadened the diagnostic demands across different question types, even though the progression was mainly planned rather than responsive.');
   if (misunderstand && scaffolds) strengths.push('You showed evidence of reformulating when communication became difficult.');
   if (missing.length) developments.push(`Coverage still missing or weak: ${missing.join(', ')}.`);
   return { scores, coverage, distance, verdict, strengths, developments, questions: tester.length, turns: state.transcript.length };
@@ -767,6 +940,9 @@ async function newSession() {
   state.warmServices = {};
   state.warmStatus = 'Not started';
   state.transcript = [];
+  state.pendingAudioBlob = null;
+  state.pendingAudioMime = '';
+  state.pendingAudioLabel = '';
   state.results = null;
   state.reveal = null;
   state.error = '';
@@ -842,7 +1018,7 @@ function interviewView() {
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
     <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
-    <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
+    <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
 }
 
@@ -864,7 +1040,7 @@ function resultsView() {
     <section class="card span12"><h3>Why this band?</h3><div class="threeCol"><div class="compare"><h4>Why not lower?</h4><p>${escapeHtml(l.distinguish.below)}</p></div><div class="compare"><h4>Best fit · ${escapeHtml(l.id)}</h4><p>${escapeHtml(l.summary)}</p></div><div class="compare"><h4>Why not higher?</h4><p>${escapeHtml(l.distinguish.above)}</p></div></div></section>
     <section class="card span7"><h3>Five spoken-performance dimensions</h3><div class="dimensions">${Object.entries(l.dimensions).map(([k,v]) => `<div class="dimension"><strong>${escapeHtml(cap(k))}</strong><span>${escapeHtml(v)}</span></div>`).join('')}</div></section>
     <section class="card span5"><h3>Your interviewing</h3><h4 style="margin-bottom:5px">What worked</h4><ul class="clean">${(r.strengths.length ? r.strengths : ['You completed enough interaction to make a level judgement.']).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul><h4 style="margin-bottom:5px">Next development</h4><ul class="clean">${r.developments.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>${state.sessionAudioUrl ? `<a class="btn secondary" href="${state.sessionAudioUrl}" download="tester-interview.webm" style="display:inline-block;text-decoration:none;margin-top:7px">Download tester microphone audio</a>` : '<div class="small">A microphone recording link appears here if you used the microphone during the interview.</div>'}</section>
-    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> turns showed a controlled grammatical/lexical limitation.</p>${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
+    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> turns showed a controlled grammatical/lexical limitation${reveal.calibration_report.age_adjustment_turns ? ` · <strong>${reveal.calibration_report.age_adjustment_turns}</strong> turn(s) needed life-stage grounding` : ''}.</p>${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
     <section class="card span12"><h3>Central AI coach note</h3><p style="white-space:pre-wrap;color:var(--ink)">${escapeHtml(reveal.coach_note || 'No coach note generated.')}</p><div class="notice">Pronunciation is deliberately not scored yet. Transcript text alone cannot validly determine individual sounds, stress or prosody.</div></section>
     <section class="card span12"><div class="btnRow" style="justify-content:space-between"><button class="btn secondary" id="newSession">← New random learner</button><button class="btn" id="reviewTranscript">Show transcript</button></div><div id="resultTranscript" class="hidden" style="margin-top:15px"><div class="chat" style="max-height:420px">${state.transcript.map(turnHtml).join('')}</div></div></section>
   </div>`;
@@ -874,7 +1050,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Performance Engine v0.10.2</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Realism & Latency Engine v0.11.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
@@ -890,6 +1066,7 @@ function bind() {
   document.querySelectorAll('[data-input-mode]').forEach(el => el.addEventListener('click', () => { state.inputMode = el.dataset.inputMode; localStorage.setItem('cefr-input-mode', state.inputMode); render(); }));
   document.querySelector('#startInterview')?.addEventListener('click', startInterview);
   document.querySelector('#retryWarm')?.addEventListener('click', retryWarmServices);
+  document.querySelector('#retryTranscription')?.addEventListener('click', retryPendingTranscription);
   const input = document.querySelector('#questionInput');
   input?.addEventListener('input', e => { state.input = e.target.value; });
   input?.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askLearner(state.input); } });
@@ -902,6 +1079,7 @@ function bind() {
   }
   document.querySelector('#liveToggle')?.addEventListener('click', () => state.liveListening ? stopLiveListening() : startLiveListening());
   document.querySelector('#stopAudio')?.addEventListener('click', () => {
+    speechPlaybackToken += 1;
     try { currentAudio?.pause(); } catch {}
     currentAudio = null;
     if ('speechSynthesis' in window) speechSynthesis.cancel();

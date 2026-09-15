@@ -1,9 +1,9 @@
 {
-  "name": "CEFR Tester Trainer — CEFR Performance Engine",
+  "name": "CEFR Tester Trainer — Realism & Latency Engine",
   "short_name": "CEFR Trainer",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#f3f6fa",
   "theme_color": "#142a4c",
-  "description": "Browser-only CEFR tester training client with hidden-band response contracts and server-side calibration validation."
+  "description": "Browser-only CEFR tester training client with age-grounded hidden-band performance contracts, robust speech retry and low-latency chunked learner voice."
 }
