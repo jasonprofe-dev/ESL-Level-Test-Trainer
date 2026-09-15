@@ -30,6 +30,7 @@ const state = {
   voiceReady: false,
   warmServices: {},
   warmStatus: 'Not started',
+  warmFailed: false,
   warmStartedAt: 0,
   transcript: [],
   input: '',
@@ -199,6 +200,7 @@ async function startInterview() {
   state.speechReady = false;
   state.voiceReady = false;
   state.warmStatus = 'Creating learner and preparing services…';
+  state.warmFailed = false;
   render();
   try {
     const res = await apiFetch('/api/session/start', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
@@ -259,18 +261,27 @@ async function pollLearnerReady() {
       state.warmServices = data.services || {};
       if (state.textReady) startInterviewClock();
       const seconds = Math.max(0, Math.round((Date.now() - state.warmStartedAt) / 1000));
+      const serviceErrors = Object.entries(state.warmServices)
+        .filter(([, svc]) => svc?.status === 'error')
+        .map(([name, svc]) => `${name.toUpperCase()}: ${String(svc?.error || 'startup failed')}`);
+      state.warmFailed = serviceErrors.length > 0 || data.status === 'error';
       const bits = [
-        `AI ${state.textReady ? '✓' : '…'}`,
-        `Whisper ${state.speechReady ? '✓' : '…'}`,
-        `Voice ${state.voiceReady ? '✓' : '…'}`,
+        `AI ${state.warmServices?.llm?.status === 'error' ? '✕' : (state.textReady ? '✓' : '…')}`,
+        `Whisper ${state.warmServices?.stt?.status === 'error' ? '✕' : (state.speechReady ? '✓' : '…')}`,
+        `Voice ${state.warmServices?.tts?.status === 'error' ? '✕' : (state.voiceReady ? '✓' : '…')}`,
       ];
       state.warmStatus = `${bits.join(' · ')} · ${seconds}s`;
+      if (serviceErrors.length) state.warmStatus += ` · ${serviceErrors.join(' | ')}`;
       if (state.speechReady) state.sttStatus = `Server speech recognition · ${state.serverHealth?.whisper || 'Whisper'} ready`;
       if (state.voiceReady) state.ttsStatus = `Server learner voice · ${state.serverHealth?.tts || 'Kokoro'} ready`;
       if (state.learnerReady) {
         clearInterval(warmPollTimer);
         warmPollTimer = null;
         state.info = 'All interview services are ready.';
+      } else if (state.warmFailed) {
+        clearInterval(warmPollTimer);
+        warmPollTimer = null;
+        state.info = '';
       } else if (state.textReady && !state.info) {
         state.info = 'Learner AI is ready for typed questions while speech services finish warming.';
       }
@@ -282,6 +293,38 @@ async function pollLearnerReady() {
   };
   await poll();
   if (!state.learnerReady) warmPollTimer = setInterval(poll, 2000);
+}
+
+
+async function retryWarmServices() {
+  if (!state.authenticated) return;
+  state.warmFailed = false;
+  state.error = '';
+  state.info = 'Retrying failed interview services once…';
+  state.warmStartedAt = Date.now();
+  state.warmStatus = 'Retry requested…';
+  render();
+  try {
+    const res = await apiFetch('/api/warm/retry', { method: 'POST', headers: authHeaders() });
+    if (!res.ok) throw new Error(await parseApiError(res));
+    const data = await res.json();
+    state.warmServices = data.services || {};
+    state.textReady = !!data.text_ready;
+    state.speechReady = !!data.speech_ready;
+    state.voiceReady = !!data.voice_ready;
+    state.learnerReady = !!data.ready;
+    if (state.learnerReady) {
+      state.info = 'All interview services are ready.';
+      render();
+      return;
+    }
+    state.info = '';
+    pollLearnerReady();
+  } catch (e) {
+    state.warmFailed = true;
+    state.error = `Could not retry interview services: ${e.message}`;
+    render();
+  }
 }
 
 async function askLearner(question) {
@@ -797,7 +840,7 @@ function interviewView() {
     : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.speechReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
   return `<div class="grid"><section class="card span12">
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
-    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>Preparing interview services…</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.</span></div>` : ''}
+    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
     <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
@@ -831,7 +874,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Performance Engine v0.10.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Performance Engine v0.10.2</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
@@ -846,6 +889,7 @@ function bind() {
   document.querySelectorAll('[data-voice-mode]').forEach(el => el.addEventListener('click', () => { state.voiceMode = el.dataset.voiceMode; localStorage.setItem('cefr-voice-mode', state.voiceMode); render(); }));
   document.querySelectorAll('[data-input-mode]').forEach(el => el.addEventListener('click', () => { state.inputMode = el.dataset.inputMode; localStorage.setItem('cefr-input-mode', state.inputMode); render(); }));
   document.querySelector('#startInterview')?.addEventListener('click', startInterview);
+  document.querySelector('#retryWarm')?.addEventListener('click', retryWarmServices);
   const input = document.querySelector('#questionInput');
   input?.addEventListener('input', e => { state.input = e.target.value; });
   input?.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askLearner(state.input); } });
