@@ -59,6 +59,7 @@ const state = {
   lastSttSecondPass: false,
   lastTtsMs: null,
   lastTtsTotalMs: null,
+  pendingVoiceText: '',
   pendingAudioBlob: null,
   pendingAudioMime: '',
   pendingAudioLabel: '',
@@ -226,6 +227,7 @@ async function startInterview() {
     state.pendingAudioBlob = null;
     state.pendingAudioMime = '';
     state.pendingAudioLabel = '';
+    state.pendingVoiceText = '';
     state.results = null;
     state.reveal = null;
     state.guess = 'B1.2';
@@ -436,15 +438,40 @@ async function synthesizeServer(text, { quiet = false } = {}) {
     render();
   }
   const path = state.sessionId ? `/api/session/${encodeURIComponent(state.sessionId)}/tts` : '/api/tts';
-  const res = await apiFetch(path, {
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ text, voice, speed: 0.96 }),
-  });
-  if (!res.ok) throw new Error(await parseApiError(res));
-  const processingMs = Number(res.headers.get('X-Processing-Ms') || 0);
-  const blob = await res.blob();
-  return { blob, processingMs, wallMs: performance.now() - wallStarted };
+  let lastError = null;
+  let clientRetry = false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await apiFetch(path, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ text, voice, speed: 0.96 }),
+      });
+      if (!res.ok) {
+        const message = await parseApiError(res);
+        if (attempt === 0 && [502, 503, 504].includes(res.status)) {
+          clientRetry = true;
+          await sleep(300);
+          continue;
+        }
+        throw new Error(message);
+      }
+      const processingMs = Number(res.headers.get('X-Processing-Ms') || 0);
+      const blob = await res.blob();
+      return { blob, processingMs, wallMs: performance.now() - wallStarted, clientRetry };
+    } catch (e) {
+      lastError = e;
+      const msg = String(e?.message || e || '');
+      const transient = /failed to fetch|network|load failed|connection|fetch/i.test(msg) || e instanceof TypeError;
+      if (attempt === 0 && transient) {
+        clientRetry = true;
+        await sleep(300);
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastError || new Error('Learner voice request failed.');
 }
 
 function splitSpeechChunks(text) {
@@ -452,20 +479,21 @@ function splitSpeechChunks(text) {
   if (!raw) return [];
   const sentences = raw.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [raw];
   const chunks = [];
-  for (const sentenceRaw of sentences) {
-    const sentence = sentenceRaw.trim();
+  for (let si = 0; si < sentences.length; si += 1) {
+    const sentence = sentences[si].trim();
     if (!sentence) continue;
-    if (sentence.length <= 175) {
+    // v0.12 starts the first audio much sooner: aim for roughly one short clause
+    // (about 70-95 chars) before allowing longer subsequent chunks.
+    const target = chunks.length === 0 ? 90 : 150;
+    if (sentence.length <= target) {
       chunks.push(sentence);
       continue;
     }
-    // A very long sentence delays first audio. Split only at natural comma/semicolon
-    // boundaries; never invent or remove learner wording.
     const pieces = sentence.split(/(?<=[,;:])\s+/);
     let current = '';
     for (const piece of pieces) {
       const candidate = current ? `${current} ${piece}` : piece;
-      if (current && candidate.length > 155) {
+      if (current && candidate.length > target) {
         chunks.push(current.trim());
         current = piece;
       } else {
@@ -473,9 +501,6 @@ function splitSpeechChunks(text) {
       }
     }
     if (current.trim()) chunks.push(current.trim());
-  }
-  if (chunks.length > 1 && chunks[0].length < 45 && `${chunks[0]} ${chunks[1]}`.length <= 175) {
-    chunks.splice(0, 2, `${chunks[0]} ${chunks[1]}`);
   }
   return chunks.length ? chunks : [raw];
 }
@@ -554,17 +579,28 @@ async function speak(text) {
       }
     }
     state.lastTtsTotalMs = totalGenerationMs || null;
+    state.pendingVoiceText = '';
     state.ttsStatus = state.lastTtsMs
       ? `Kokoro ready · first audio ${(state.lastTtsMs / 1000).toFixed(1)}s`
       : `Ready · ${state.serverHealth?.tts || 'central Kokoro'}`;
   } catch (e) {
     // Never silently change the learner to a completely different browser voice.
     state.ttsStatus = 'Central learner voice failed for this turn';
+    state.pendingVoiceText = text;
     state.error = `Learner voice error: ${e.message}. The written answer is still valid; no substitute voice was used.`;
   } finally {
     state.speaking = false;
     render();
   }
+}
+
+async function retryPendingVoice() {
+  if (!state.pendingVoiceText || state.speaking) return;
+  const text = state.pendingVoiceText;
+  state.error = '';
+  state.ttsStatus = 'Retrying learner voice…';
+  render();
+  await speak(text);
 }
 
 function createMediaRecorder(stream) {
@@ -1018,7 +1054,7 @@ function interviewView() {
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
     <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
-    <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
+    <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><div class="btnRow"><button class="btn ghost" id="stopAudio">Stop learner audio</button>${state.pendingVoiceText ? `<button class="btn secondary" id="retryVoice">Retry learner voice</button>` : ''}</div><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
 }
 
@@ -1040,7 +1076,7 @@ function resultsView() {
     <section class="card span12"><h3>Why this band?</h3><div class="threeCol"><div class="compare"><h4>Why not lower?</h4><p>${escapeHtml(l.distinguish.below)}</p></div><div class="compare"><h4>Best fit · ${escapeHtml(l.id)}</h4><p>${escapeHtml(l.summary)}</p></div><div class="compare"><h4>Why not higher?</h4><p>${escapeHtml(l.distinguish.above)}</p></div></div></section>
     <section class="card span7"><h3>Five spoken-performance dimensions</h3><div class="dimensions">${Object.entries(l.dimensions).map(([k,v]) => `<div class="dimension"><strong>${escapeHtml(cap(k))}</strong><span>${escapeHtml(v)}</span></div>`).join('')}</div></section>
     <section class="card span5"><h3>Your interviewing</h3><h4 style="margin-bottom:5px">What worked</h4><ul class="clean">${(r.strengths.length ? r.strengths : ['You completed enough interaction to make a level judgement.']).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul><h4 style="margin-bottom:5px">Next development</h4><ul class="clean">${r.developments.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>${state.sessionAudioUrl ? `<a class="btn secondary" href="${state.sessionAudioUrl}" download="tester-interview.webm" style="display:inline-block;text-decoration:none;margin-top:7px">Download tester microphone audio</a>` : '<div class="small">A microphone recording link appears here if you used the microphone during the interview.</div>'}</section>
-    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> turns showed a controlled grammatical/lexical limitation${reveal.calibration_report.age_adjustment_turns ? ` · <strong>${reveal.calibration_report.age_adjustment_turns}</strong> turn(s) needed life-stage grounding` : ''}.</p>${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
+    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> turns showed a controlled grammatical/lexical limitation${reveal.calibration_report.turns_with_planning_signals ? ` · <strong>${reveal.calibration_report.turns_with_planning_signals}</strong> showed audible planning/repair` : ''}${reveal.calibration_report.hard_gate_forced_turns ? ` · hard band gate intervened on <strong>${reveal.calibration_report.hard_gate_forced_turns}</strong>` : ''}${reveal.calibration_report.age_adjustment_turns ? ` · <strong>${reveal.calibration_report.age_adjustment_turns}</strong> turn(s) needed life-stage grounding` : ''}.</p>${reveal.calibration_report.hard_gate_failures ? `<div class="notice"><strong>Simulation fidelity warning:</strong> ${reveal.calibration_report.hard_gate_failures} learner turn(s) remained above the required accuracy ceiling after deterministic control. Treat this attempt cautiously for standardisation.</div>` : ''}${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
     <section class="card span12"><h3>Central AI coach note</h3><p style="white-space:pre-wrap;color:var(--ink)">${escapeHtml(reveal.coach_note || 'No coach note generated.')}</p><div class="notice">Pronunciation is deliberately not scored yet. Transcript text alone cannot validly determine individual sounds, stress or prosody.</div></section>
     <section class="card span12"><div class="btnRow" style="justify-content:space-between"><button class="btn secondary" id="newSession">← New random learner</button><button class="btn" id="reviewTranscript">Show transcript</button></div><div id="resultTranscript" class="hidden" style="margin-top:15px"><div class="chat" style="max-height:420px">${state.transcript.map(turnHtml).join('')}</div></div></section>
   </div>`;
@@ -1050,7 +1086,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Realism & Latency Engine v0.11.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Lower-Level Fidelity Engine v0.12.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
@@ -1067,6 +1103,7 @@ function bind() {
   document.querySelector('#startInterview')?.addEventListener('click', startInterview);
   document.querySelector('#retryWarm')?.addEventListener('click', retryWarmServices);
   document.querySelector('#retryTranscription')?.addEventListener('click', retryPendingTranscription);
+  document.querySelector('#retryVoice')?.addEventListener('click', retryPendingVoice);
   const input = document.querySelector('#questionInput');
   input?.addEventListener('input', e => { state.input = e.target.value; });
   input?.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askLearner(state.input); } });
