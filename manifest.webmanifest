@@ -1,9 +1,9 @@
 {
-  "name": "CEFR Tester Trainer — Central Server Edition",
+  "name": "CEFR Tester Trainer — Calibration Engine",
   "short_name": "CEFR Trainer",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#f3f6fa",
   "theme_color": "#142a4c",
-  "description": "Browser-only CEFR tester training client connected to a central high-quality AI and speech server."
+  "description": "Browser-only CEFR tester training client with hidden-band response contracts and server-side calibration validation."
 }

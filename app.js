@@ -24,6 +24,9 @@ const state = {
   inputMode: localStorage.getItem('cefr-input-mode') || 'live',
   sessionId: null,
   learner: null,
+  learnerReady: false,
+  warmStatus: 'Not started',
+  warmStartedAt: 0,
   transcript: [],
   input: '',
   busy: false,
@@ -57,6 +60,7 @@ let vadSource = null;
 let vadAnalyser = null;
 let vadRaf = null;
 let cancelCurrentUtterance = false;
+let warmPollTimer = null;
 
 function escapeHtml(value = '') { return String(value).replace(/[&<>'"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;' }[c])); }
 function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
@@ -102,7 +106,7 @@ async function checkServer({ quiet = false } = {}) {
     const data = await res.json();
     state.serverHealth = data;
     state.serverConnected = !!data.ok;
-    state.serverStatus = data.ollama === false ? 'Server reachable · learner model not ready' : `Connected · ${data.model || 'AI service ready'}`;
+    state.serverStatus = data.learner_engine_ready === false ? 'Server reachable · learner model not ready' : `Connected · ${data.model || 'AI service ready'}`;
     state.sttStatus = `Server speech recognition · ${data.whisper || 'Whisper'}`;
     state.ttsStatus = `Server learner voice · ${data.tts || 'Kokoro'}`;
     if (state.token) await verifyToken({ quiet: true });
@@ -125,6 +129,7 @@ async function verifyToken({ quiet = false } = {}) {
     const res = await apiFetch('/api/me', { headers: authHeaders() });
     if (!res.ok) throw new Error(await parseApiError(res));
     state.authenticated = true;
+    apiFetch('/api/warm', { method: 'POST', headers: authHeaders() }).catch(() => {});
     if (!quiet) render();
     return true;
   } catch {
@@ -157,6 +162,9 @@ async function authenticate() {
     state.authenticated = true;
     state.accessCode = '';
     state.info = 'Connected securely to the Modal training server.';
+    // Start the expensive learner model warming immediately after sign-in. This is
+    // fire-and-forget; the browser never waits on the cold-start HTTP request.
+    apiFetch('/api/warm', { method: 'POST', headers: authHeaders() }).catch(() => {});
   } catch (e) {
     state.error = `Could not sign in: ${e.message}`;
   } finally {
@@ -168,9 +176,13 @@ async function authenticate() {
 async function startInterview() {
   if (!state.authenticated) { state.error = 'Connect to the Modal server first.'; render(); return; }
   releaseMic();
+  clearInterval(warmPollTimer);
+  warmPollTimer = null;
   state.error = '';
   state.info = '';
   state.busy = true;
+  state.learnerReady = false;
+  state.warmStatus = 'Creating learner and preparing AI…';
   render();
   try {
     const res = await apiFetch('/api/session/start', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
@@ -178,20 +190,20 @@ async function startInterview() {
     const data = await res.json();
     state.sessionId = data.session_id;
     state.learner = data.learner;
+    state.learnerReady = data.warm_status === 'ready';
+    state.warmStatus = state.learnerReady ? 'Learner AI ready' : 'Preparing learner AI on Modal…';
+    state.warmStartedAt = Date.now();
     state.transcript = [];
     state.input = '';
     state.results = null;
     state.reveal = null;
     state.guess = 'B1.2';
     state.stage = 'interview';
-    state.startedAt = Date.now();
+    state.startedAt = 0;
     state.elapsed = 0;
     clearInterval(state.elapsedTimer);
-    state.elapsedTimer = setInterval(() => {
-      state.elapsed = Date.now() - state.startedAt;
-      const el = document.querySelector('#timer');
-      if (el) el.textContent = formatClock(state.elapsed);
-    }, 1000);
+    if (state.learnerReady) startInterviewClock();
+    else pollLearnerReady();
   } catch (e) {
     state.error = `Could not start interview: ${e.message}`;
   } finally {
@@ -200,9 +212,52 @@ async function startInterview() {
   }
 }
 
+function startInterviewClock() {
+  if (state.startedAt) return;
+  state.startedAt = Date.now();
+  state.elapsed = 0;
+  clearInterval(state.elapsedTimer);
+  state.elapsedTimer = setInterval(() => {
+    state.elapsed = Date.now() - state.startedAt;
+    const el = document.querySelector('#timer');
+    if (el) el.textContent = formatClock(state.elapsed);
+  }, 1000);
+}
+
+async function pollLearnerReady() {
+  clearInterval(warmPollTimer);
+  const poll = async () => {
+    if (!state.sessionId || state.stage !== 'interview' || state.learnerReady) return;
+    try {
+      const res = await apiFetch(`/api/session/${encodeURIComponent(state.sessionId)}/ready`, { headers: authHeaders(), cache: 'no-store' });
+      if (!res.ok) throw new Error(await parseApiError(res));
+      const data = await res.json();
+      if (data.ready) {
+        state.learnerReady = true;
+        state.warmStatus = 'Learner AI ready';
+        clearInterval(warmPollTimer);
+        warmPollTimer = null;
+        startInterviewClock();
+        state.info = 'Learner AI is ready. You can begin the interview.';
+        render();
+        return;
+      }
+      const seconds = Math.max(0, Math.round((Date.now() - state.warmStartedAt) / 1000));
+      state.warmStatus = `Preparing learner AI… ${seconds}s`;
+      render();
+    } catch (e) {
+      state.warmStatus = `Still preparing · ${e.message}`;
+      render();
+    }
+  };
+  await poll();
+  if (!state.learnerReady) warmPollTimer = setInterval(poll, 2500);
+}
+
 async function askLearner(question) {
   const q = String(question || '').trim();
   if (!q || state.busy || !state.sessionId) return;
+  if (!state.learnerReady) { state.error = 'The learner AI is still preparing. Wait for the Ready message.'; render(); return; }
   state.error = '';
   state.input = '';
   state.transcript.push({ role: 'tester', text: q, at: Date.now() });
@@ -322,6 +377,7 @@ async function ensureMic() {
 }
 
 async function startPushToTalk() {
+  if (!state.learnerReady) { state.error = 'The learner AI is still preparing.'; render(); return; }
   if (state.recording || state.busy || state.speaking) return;
   try {
     const stream = await ensureMic();
@@ -371,6 +427,7 @@ async function processUtterance(chunks, mimeType) {
 }
 
 async function startLiveListening() {
+  if (!state.learnerReady) { state.error = 'The learner AI is still preparing.'; render(); return; }
   if (state.liveListening) return;
   try {
     await ensureMic();
@@ -580,12 +637,15 @@ async function submitGuess() {
 
 async function newSession() {
   releaseMic();
+  clearInterval(warmPollTimer); warmPollTimer = null;
   if (state.sessionId) {
     apiFetch(`/api/session/${encodeURIComponent(state.sessionId)}`, { method: 'DELETE', headers: authHeaders() }).catch(() => {});
   }
   state.stage = 'setup';
   state.sessionId = null;
   state.learner = null;
+  state.learnerReady = false;
+  state.warmStatus = 'Not started';
   state.transcript = [];
   state.results = null;
   state.reveal = null;
@@ -602,7 +662,7 @@ function inputModeButton(id, label) { return `<button class="choice ${state.inpu
 
 function setupView() {
   const h = hardware();
-  const serverReady = state.serverConnected && state.serverHealth?.ollama !== false;
+  const serverReady = state.serverConnected && state.serverHealth?.learner_engine_ready !== false;
   return `
   <div class="hero"><h2>Professional CEFR role-play, from any approved browser.</h2><p>The work computer is only the interview screen and microphone. The learner AI, high-accuracy Whisper transcription and Kokoro voice run on a Modal server, so no model or application is installed on the tester's computer.</p><div class="privacy">🌐 Browser-only client · central high-quality AI · no local model installation</div></div>
   <div class="grid">
@@ -643,7 +703,7 @@ function setupView() {
       <div class="small" style="margin-top:11px">${escapeHtml(state.sttStatus)}</div>
     </section>
     <section class="card span6">
-      <h3>5. Privacy model</h3><p>Unlike the old all-local prototype, spoken turns are sent securely to the Modal server for transcription and response generation. The v0.8.4 server does not intentionally persist uploaded turn audio.</p>
+      <h3>5. Privacy model</h3><p>Unlike the old all-local prototype, spoken turns are sent securely to the Modal server for transcription and response generation. The Modal server does not intentionally persist uploaded turn audio.</p>
       <div class="notice blue">For organisational deployment, server hosting, retention policy and access controls should be approved before broad staff rollout.</div>
     </section>
     <section class="card span12">
@@ -656,13 +716,13 @@ function interviewView() {
   const l = state.learner || {};
   const initial = (l.name || '?').slice(0, 1).toUpperCase();
   const liveControls = state.inputMode === 'live'
-    ? `<button class="btn ${state.liveListening ? 'danger' : 'primary'}" id="liveToggle">${state.liveListening ? '■ Pause live listening' : '🎙️ Start live conversation'}</button><span class="badge">${state.speaking ? 'Learner speaking' : state.busy ? 'Learner thinking' : state.speechDetected ? 'Hearing you…' : state.liveListening ? 'Listening' : 'Paused'}</span>`
-    : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
+    ? `<button class="btn ${state.liveListening ? 'danger' : 'primary'}" id="liveToggle" ${!state.learnerReady ? 'disabled' : ''}>${state.liveListening ? '■ Pause live listening' : '🎙️ Start live conversation'}</button><span class="badge">${state.speaking ? 'Learner speaking' : state.busy ? 'Learner thinking' : state.speechDetected ? 'Hearing you…' : state.liveListening ? 'Listening' : 'Paused'}</span>`
+    : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.learnerReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
   return `<div class="grid"><section class="card span12">
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
-    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>
+    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>Preparing learner AI…</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">The first cold start is prepared in the background; questions unlock automatically when the model is ready.</span></div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
-    <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode submits after ~0.9 seconds of silence.' : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
+    <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.learnerReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.learnerReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode submits after ~0.9 seconds of silence.' : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
 }
 
@@ -684,6 +744,7 @@ function resultsView() {
     <section class="card span12"><h3>Why this band?</h3><div class="threeCol"><div class="compare"><h4>Why not lower?</h4><p>${escapeHtml(l.distinguish.below)}</p></div><div class="compare"><h4>Best fit · ${escapeHtml(l.id)}</h4><p>${escapeHtml(l.summary)}</p></div><div class="compare"><h4>Why not higher?</h4><p>${escapeHtml(l.distinguish.above)}</p></div></div></section>
     <section class="card span7"><h3>Five spoken-performance dimensions</h3><div class="dimensions">${Object.entries(l.dimensions).map(([k,v]) => `<div class="dimension"><strong>${escapeHtml(cap(k))}</strong><span>${escapeHtml(v)}</span></div>`).join('')}</div></section>
     <section class="card span5"><h3>Your interviewing</h3><h4 style="margin-bottom:5px">What worked</h4><ul class="clean">${(r.strengths.length ? r.strengths : ['You completed enough interaction to make a level judgement.']).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul><h4 style="margin-bottom:5px">Next development</h4><ul class="clean">${r.developments.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>${state.sessionAudioUrl ? `<a class="btn secondary" href="${state.sessionAudioUrl}" download="tester-interview.webm" style="display:inline-block;text-decoration:none;margin-top:7px">Download tester microphone audio</a>` : '<div class="small">A microphone recording link appears here if you used the microphone during the interview.</div>'}</section>
+    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.rewritten_turns}</strong> automatically rewritten before display.</p>${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved contract warnings were detected in the displayed learner turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
     <section class="card span12"><h3>Central AI coach note</h3><p style="white-space:pre-wrap;color:var(--ink)">${escapeHtml(reveal.coach_note || 'No coach note generated.')}</p><div class="notice">Pronunciation is deliberately not scored yet. Transcript text alone cannot validly determine individual sounds, stress or prosody.</div></section>
     <section class="card span12"><div class="btnRow" style="justify-content:space-between"><button class="btn secondary" id="newSession">← New random learner</button><button class="btn" id="reviewTranscript">Show transcript</button></div><div id="resultTranscript" class="hidden" style="margin-top:15px"><div class="chat" style="max-height:420px">${state.transcript.map(turnHtml).join('')}</div></div></section>
   </div>`;
@@ -693,7 +754,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Modal Serverless Edition v0.8.4</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Modal Calibration Engine v0.9.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
@@ -742,7 +803,7 @@ function bind() {
 
 function scrollChat() { requestAnimationFrame(() => { const c = document.querySelector('#chat'); if (c) c.scrollTop = c.scrollHeight; }); }
 
-window.addEventListener('beforeunload', () => { releaseMic(); });
+window.addEventListener('beforeunload', () => { clearInterval(warmPollTimer); releaseMic(); });
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 render();
 setTimeout(() => checkServer({ quiet: false }), 400);
