@@ -25,6 +25,10 @@ const state = {
   sessionId: null,
   learner: null,
   learnerReady: false,
+  textReady: false,
+  speechReady: false,
+  voiceReady: false,
+  warmServices: {},
   warmStatus: 'Not started',
   warmStartedAt: 0,
   transcript: [],
@@ -50,6 +54,10 @@ const state = {
   revealLoading: false,
   sttStatus: 'Central Whisper ready after server connection',
   ttsStatus: 'Central Kokoro ready after server connection',
+  lastSttMs: null,
+  lastSttSecondPass: false,
+  lastTtsMs: null,
+  lastTurnTiming: null,
   error: '',
   info: '',
 };
@@ -106,9 +114,14 @@ async function checkServer({ quiet = false } = {}) {
     const data = await res.json();
     state.serverHealth = data;
     state.serverConnected = !!data.ok;
-    state.serverStatus = data.learner_engine_ready === false ? 'Server reachable · learner model not ready' : `Connected · ${data.model || 'AI service ready'}`;
-    state.sttStatus = `Server speech recognition · ${data.whisper || 'Whisper'}`;
-    state.ttsStatus = `Server learner voice · ${data.tts || 'Kokoro'}`;
+    state.textReady = !!data.text_ready;
+    state.speechReady = !!data.speech_ready;
+    state.voiceReady = !!data.voice_ready;
+    state.learnerReady = !!data.ready;
+    state.warmServices = data.services || {};
+    state.serverStatus = state.textReady ? `Connected · ${data.model || 'AI service ready'}` : 'Server reachable · learner model warming';
+    state.sttStatus = state.speechReady ? `Server speech recognition · ${data.whisper || 'Whisper'} ready` : `Server speech recognition · ${data.whisper || 'Whisper'} warming`;
+    state.ttsStatus = state.voiceReady ? `Server learner voice · ${data.tts || 'Kokoro'} ready` : `Server learner voice · ${data.tts || 'Kokoro'} warming`;
     if (state.token) await verifyToken({ quiet: true });
     if (!quiet) render();
     return true;
@@ -182,7 +195,10 @@ async function startInterview() {
   state.info = '';
   state.busy = true;
   state.learnerReady = false;
-  state.warmStatus = 'Creating learner and preparing AI…';
+  state.textReady = false;
+  state.speechReady = false;
+  state.voiceReady = false;
+  state.warmStatus = 'Creating learner and preparing services…';
   render();
   try {
     const res = await apiFetch('/api/session/start', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
@@ -190,8 +206,12 @@ async function startInterview() {
     const data = await res.json();
     state.sessionId = data.session_id;
     state.learner = data.learner;
-    state.learnerReady = data.warm_status === 'ready';
-    state.warmStatus = state.learnerReady ? 'Learner AI ready' : 'Preparing learner AI on Modal…';
+    state.textReady = !!data.text_ready;
+    state.speechReady = !!data.speech_ready;
+    state.voiceReady = !!data.voice_ready;
+    state.learnerReady = state.textReady && state.speechReady && state.voiceReady;
+    state.warmServices = data.warm_services || {};
+    state.warmStatus = state.learnerReady ? 'All interview services ready' : 'Preparing interview services on Modal…';
     state.warmStartedAt = Date.now();
     state.transcript = [];
     state.input = '';
@@ -202,8 +222,8 @@ async function startInterview() {
     state.startedAt = 0;
     state.elapsed = 0;
     clearInterval(state.elapsedTimer);
-    if (state.learnerReady) startInterviewClock();
-    else pollLearnerReady();
+    if (state.textReady) startInterviewClock();
+    if (!state.learnerReady) pollLearnerReady();
   } catch (e) {
     state.error = `Could not start interview: ${e.message}`;
   } finally {
@@ -232,18 +252,28 @@ async function pollLearnerReady() {
       const res = await apiFetch(`/api/session/${encodeURIComponent(state.sessionId)}/ready`, { headers: authHeaders(), cache: 'no-store' });
       if (!res.ok) throw new Error(await parseApiError(res));
       const data = await res.json();
-      if (data.ready) {
-        state.learnerReady = true;
-        state.warmStatus = 'Learner AI ready';
+      state.textReady = !!data.text_ready;
+      state.speechReady = !!data.speech_ready;
+      state.voiceReady = !!data.voice_ready;
+      state.learnerReady = !!data.ready;
+      state.warmServices = data.services || {};
+      if (state.textReady) startInterviewClock();
+      const seconds = Math.max(0, Math.round((Date.now() - state.warmStartedAt) / 1000));
+      const bits = [
+        `AI ${state.textReady ? '✓' : '…'}`,
+        `Whisper ${state.speechReady ? '✓' : '…'}`,
+        `Voice ${state.voiceReady ? '✓' : '…'}`,
+      ];
+      state.warmStatus = `${bits.join(' · ')} · ${seconds}s`;
+      if (state.speechReady) state.sttStatus = `Server speech recognition · ${state.serverHealth?.whisper || 'Whisper'} ready`;
+      if (state.voiceReady) state.ttsStatus = `Server learner voice · ${state.serverHealth?.tts || 'Kokoro'} ready`;
+      if (state.learnerReady) {
         clearInterval(warmPollTimer);
         warmPollTimer = null;
-        startInterviewClock();
-        state.info = 'Learner AI is ready. You can begin the interview.';
-        render();
-        return;
+        state.info = 'All interview services are ready.';
+      } else if (state.textReady && !state.info) {
+        state.info = 'Learner AI is ready for typed questions while speech services finish warming.';
       }
-      const seconds = Math.max(0, Math.round((Date.now() - state.warmStartedAt) / 1000));
-      state.warmStatus = `Preparing learner AI… ${seconds}s`;
       render();
     } catch (e) {
       state.warmStatus = `Still preparing · ${e.message}`;
@@ -251,13 +281,13 @@ async function pollLearnerReady() {
     }
   };
   await poll();
-  if (!state.learnerReady) warmPollTimer = setInterval(poll, 2500);
+  if (!state.learnerReady) warmPollTimer = setInterval(poll, 2000);
 }
 
 async function askLearner(question) {
   const q = String(question || '').trim();
   if (!q || state.busy || !state.sessionId) return;
-  if (!state.learnerReady) { state.error = 'The learner AI is still preparing. Wait for the Ready message.'; render(); return; }
+  if (!state.textReady) { state.error = 'The learner AI is still preparing. Wait for AI ✓.'; render(); return; }
   state.error = '';
   state.input = '';
   state.transcript.push({ role: 'tester', text: q, at: Date.now() });
@@ -265,6 +295,7 @@ async function askLearner(question) {
   state.sttStatus = state.liveListening ? 'Central AI is preparing the learner response…' : state.sttStatus;
   render(); scrollChat();
   try {
+    const aiStarted = performance.now();
     const res = await apiFetch(`/api/session/${encodeURIComponent(state.sessionId)}/chat`, {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
@@ -273,6 +304,8 @@ async function askLearner(question) {
     if (!res.ok) throw new Error(await parseApiError(res));
     const data = await res.json();
     const reply = String(data.reply || '').trim() || "Sorry, I'm not sure what to say.";
+    const aiMs = Number(data.timings?.total_ai_ms || (performance.now() - aiStarted));
+    state.lastTurnTiming = { sttMs: state.lastSttMs, aiMs, rewritten: !!data.rewritten };
     state.transcript.push({ role: 'learner', text: reply, at: Date.now() });
     state.busy = false;
     render(); scrollChat();
@@ -286,29 +319,39 @@ async function askLearner(question) {
   }
 }
 
-async function transcribeServer(blob) {
+async function transcribeServer(blob, mimeType = 'audio/webm') {
   const form = new FormData();
-  form.append('audio', blob, 'utterance.webm');
+  const ext = /ogg/i.test(mimeType) ? 'ogg' : 'webm';
+  form.append('audio', blob, `utterance.${ext}`);
   state.sttStatus = 'Transcribing on the Modal server…';
   render();
   const res = await apiFetch('/api/transcribe', { method: 'POST', headers: authHeaders(), body: form });
   if (!res.ok) throw new Error(await parseApiError(res));
   const data = await res.json();
-  return String(data.text || '').trim();
+  return {
+    text: String(data.text || '').trim(),
+    needsRetry: !!data.needs_retry,
+    retryReason: String(data.retry_reason || ''),
+    durationSeconds: Number(data.duration_seconds || 0),
+    processingMs: Number(data.processing_ms || 0),
+    automaticSecondPass: !!data.automatic_second_pass,
+  };
 }
 
 async function synthesizeServer(text) {
   const style = VOICE_STYLES.find(v => v.id === state.selectedVoiceStyle) || VOICE_STYLES[0];
   const voice = state.learner?.gender === 'boy' ? style.boy : style.girl;
-  state.ttsStatus = 'Generating learner voice on the Modal server…';
+  state.ttsStatus = 'Generating the same learner voice on Modal…';
   render();
-  const res = await apiFetch('/api/tts', {
+  const path = state.sessionId ? `/api/session/${encodeURIComponent(state.sessionId)}/tts` : '/api/tts';
+  const res = await apiFetch(path, {
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ text, voice, speed: 0.96 }),
   });
   if (!res.ok) throw new Error(await parseApiError(res));
-  return await res.blob();
+  const processingMs = Number(res.headers.get('X-Processing-Ms') || 0);
+  return { blob: await res.blob(), processingMs };
 }
 
 async function speak(text) {
@@ -328,39 +371,46 @@ async function speak(text) {
       }
       return;
     }
-    const blob = await synthesizeServer(text);
-    const url = URL.createObjectURL(blob);
+    if (!state.voiceReady) {
+      state.ttsStatus = 'Learner voice is still warming; text shown without substituting a different voice.';
+      return;
+    }
+    const result = await synthesizeServer(text);
+    state.lastTtsMs = result.processingMs || null;
+    const url = URL.createObjectURL(result.blob);
     await new Promise((resolve, reject) => {
       currentAudio = new Audio(url);
       currentAudio.onended = () => { URL.revokeObjectURL(url); currentAudio = null; resolve(); };
       currentAudio.onerror = () => { URL.revokeObjectURL(url); currentAudio = null; reject(new Error('Audio playback failed.')); };
       currentAudio.play().catch(reject);
     });
-    state.ttsStatus = `Ready · ${state.serverHealth?.tts || 'central Kokoro'}`;
+    state.ttsStatus = state.lastTtsMs ? `Kokoro ready · last voice ${(state.lastTtsMs / 1000).toFixed(1)}s` : `Ready · ${state.serverHealth?.tts || 'central Kokoro'}`;
   } catch (e) {
-    state.ttsStatus = 'Central learner voice unavailable — browser voice used';
-    state.info = 'The central voice service could not respond, so this turn used the browser system voice.';
-    if ('speechSynthesis' in window) {
-      await new Promise(resolve => {
-        const u = new SpeechSynthesisUtterance(text);
-        u.lang = 'en-GB'; u.rate = 0.95; u.onend = resolve; u.onerror = resolve;
-        speechSynthesis.speak(u);
-      });
-    }
+    // Never silently change Adam/Mia to a completely different browser voice.
+    state.ttsStatus = 'Central learner voice failed for this turn';
+    state.error = `Learner voice error: ${e.message}. The written answer is still valid; no substitute voice was used.`;
   } finally {
     state.speaking = false;
     render();
   }
 }
 
+function createMediaRecorder(stream) {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+  const mimeType = candidates.find(t => window.MediaRecorder?.isTypeSupported?.(t));
+  const options = { audioBitsPerSecond: 128000 };
+  if (mimeType) options.mimeType = mimeType;
+  return new MediaRecorder(stream, options);
+}
+
 async function ensureMic() {
   if (state.micStream?.active) return state.micStream;
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone access is not supported in this browser.');
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   state.micStream = stream;
   if ('MediaRecorder' in window && !state.sessionRecorder) {
     state.sessionChunks = [];
-    const rec = new MediaRecorder(stream);
+    const rec = createMediaRecorder(stream);
     rec.ondataavailable = e => { if (e.data?.size) state.sessionChunks.push(e.data); };
     rec.onstop = () => {
       if (state.sessionChunks.length) {
@@ -377,13 +427,13 @@ async function ensureMic() {
 }
 
 async function startPushToTalk() {
-  if (!state.learnerReady) { state.error = 'The learner AI is still preparing.'; render(); return; }
+  if (!state.speechReady) { state.error = 'Whisper is still preparing. Wait for Whisper ✓ or type the question.'; render(); return; }
   if (state.recording || state.busy || state.speaking) return;
   try {
     const stream = await ensureMic();
     cancelCurrentUtterance = false;
     state.utteranceChunks = [];
-    const rec = new MediaRecorder(stream);
+    const rec = createMediaRecorder(stream);
     state.recordingMode = 'push';
     rec.ondataavailable = e => { if (e.data?.size) state.utteranceChunks.push(e.data); };
     rec.onstop = async () => {
@@ -407,13 +457,26 @@ function stopPushToTalk() {
 async function processUtterance(chunks, mimeType) {
   try {
     const blob = new Blob(chunks, { type: mimeType || 'audio/webm' });
-    const text = await transcribeServer(blob);
-    state.sttStatus = state.liveListening ? 'Live listening ready' : `Ready · ${state.serverHealth?.whisper || 'central Whisper'}`;
+    const result = await transcribeServer(blob, mimeType);
+    state.lastSttMs = result.processingMs || null;
+    state.lastSttSecondPass = !!result.automaticSecondPass;
+    state.sttStatus = result.processingMs
+      ? `Whisper finished in ${(result.processingMs / 1000).toFixed(1)}s${result.automaticSecondPass ? ' · automatic accuracy retry used' : ''}`
+      : (state.liveListening ? 'Live listening ready' : `Ready · ${state.serverHealth?.whisper || 'central Whisper'}`);
     render();
-    if (text) {
-      state.input = text;
+    if (result.needsRetry) {
+      state.input = result.text;
+      state.info = result.text
+        ? `Speech recognition was uncertain and was NOT sent to the learner. I heard: “${result.text}”. Edit it and press Ask, or try the microphone again.`
+        : 'Speech recognition was uncertain and nothing was sent to the learner. Please try the microphone again or type the question.';
+      if (state.liveListening) stopLiveListening({ keepMic: true });
       render();
-      await askLearner(text);
+      return;
+    }
+    if (result.text) {
+      state.input = result.text;
+      render();
+      await askLearner(result.text);
     } else {
       state.error = 'No speech was detected. Try again or type the question.';
       render();
@@ -427,7 +490,7 @@ async function processUtterance(chunks, mimeType) {
 }
 
 async function startLiveListening() {
-  if (!state.learnerReady) { state.error = 'The learner AI is still preparing.'; render(); return; }
+  if (!state.speechReady) { state.error = 'Whisper is still preparing. Wait for Whisper ✓ or use typed questions.'; render(); return; }
   if (state.liveListening) return;
   try {
     await ensureMic();
@@ -475,7 +538,7 @@ async function beginVadCycle() {
     cancelCurrentUtterance = false;
     state.utteranceChunks = [];
     state.speechDetected = false;
-    const rec = new MediaRecorder(stream);
+    const rec = createMediaRecorder(stream);
     state.utteranceRecorder = rec;
     state.recordingMode = 'live';
     state.recording = true;
@@ -483,9 +546,11 @@ async function beginVadCycle() {
     let speechStart = 0;
     let lastVoice = 0;
     let renderedSpeech = false;
-    const SILENCE_MS = 900;
-    const MIN_SPEECH_MS = 420;
-    const RMS_THRESHOLD = 0.018;
+    const SILENCE_MS = 1850;
+    const MIN_SPEECH_MS = 320;
+    let noiseFloor = 0.004;
+    let threshold = 0.009;
+    let noiseSamples = 0;
     const MAX_WAIT_MS = 45000;
 
     rec.ondataavailable = e => { if (e.data?.size) state.utteranceChunks.push(e.data); };
@@ -500,7 +565,7 @@ async function beginVadCycle() {
       if (!hadSpeech) { setTimeout(beginVadCycle, 200); return; }
       await processUtterance(state.utteranceChunks, rec.mimeType || 'audio/webm');
     };
-    rec.start(250);
+    rec.start(100);
     state.sttStatus = 'Listening — begin speaking';
     render();
 
@@ -512,7 +577,15 @@ async function beginVadCycle() {
       for (const x of samples) sum += x * x;
       const rms = Math.sqrt(sum / samples.length);
       const now = performance.now();
-      if (rms > RMS_THRESHOLD) {
+      // Brief ambient calibration makes the work-laptop microphone less dependent
+      // on one hard-coded volume threshold. The recorder is already running, so the
+      // beginning of speech is retained even if the user starts quickly.
+      if (!state.speechDetected && now - cycleStart < 650 && rms < 0.03) {
+        noiseFloor = ((noiseFloor * noiseSamples) + rms) / (noiseSamples + 1);
+        noiseSamples += 1;
+        threshold = Math.max(0.006, Math.min(0.02, noiseFloor * 2.6));
+      }
+      if (rms > threshold) {
         if (!speechStart) speechStart = now;
         lastVoice = now;
         if (!state.speechDetected && now - speechStart >= 90) {
@@ -645,6 +718,10 @@ async function newSession() {
   state.sessionId = null;
   state.learner = null;
   state.learnerReady = false;
+  state.textReady = false;
+  state.speechReady = false;
+  state.voiceReady = false;
+  state.warmServices = {};
   state.warmStatus = 'Not started';
   state.transcript = [];
   state.results = null;
@@ -662,7 +739,7 @@ function inputModeButton(id, label) { return `<button class="choice ${state.inpu
 
 function setupView() {
   const h = hardware();
-  const serverReady = state.serverConnected && state.serverHealth?.learner_engine_ready !== false;
+  const serverReady = state.serverConnected;
   return `
   <div class="hero"><h2>Professional CEFR role-play, from any approved browser.</h2><p>The work computer is only the interview screen and microphone. The learner AI, high-accuracy Whisper transcription and Kokoro voice run on a Modal server, so no model or application is installed on the tester's computer.</p><div class="privacy">🌐 Browser-only client · central high-quality AI · no local model installation</div></div>
   <div class="grid">
@@ -670,9 +747,9 @@ function setupView() {
       <h3>1. Central training server</h3><p>The server keeps the learner's true CEFR band hidden until you submit your judgement. Model secrets and infrastructure credentials never live in GitHub Pages.</p>
       <div class="statusList">
         ${statusItem('Central API', state.serverConnected, state.serverStatus, state.serverConnected ? 'Online' : 'Offline')}
-        ${statusItem('Learner AI', !!serverReady, state.serverHealth?.model || 'Qwen 3.5 9B target', serverReady ? 'Ready' : 'Waiting')}
-        ${statusItem('Speech recognition', state.serverConnected, state.serverHealth?.whisper || 'Whisper large-v3-turbo', state.serverConnected ? 'Server-side' : 'Waiting')}
-        ${statusItem('Learner voice', state.serverConnected, state.serverHealth?.tts || 'Kokoro-82M', state.serverConnected ? 'Server-side' : 'Waiting')}
+        ${statusItem('Learner AI', state.textReady, state.serverHealth?.model || 'Qwen 3.5 9B target', state.textReady ? 'Ready' : 'Warms after sign-in')}
+        ${statusItem('Speech recognition', state.speechReady, state.serverHealth?.whisper || 'Whisper large-v3-turbo', state.speechReady ? 'Ready' : 'Warms in parallel')}
+        ${statusItem('Learner voice', state.voiceReady, state.serverHealth?.tts || 'Kokoro-82M', state.voiceReady ? 'Ready' : 'Warms in parallel')}
       </div>
       <div class="btnRow" style="margin-top:12px"><button class="btn secondary" id="checkServer">Check server</button></div>
       ${!apiConfigured() ? `<div class="notice" style="margin-top:14px"><strong>Development status:</strong> the Modal server hostname has not been inserted into <code>config.js</code> yet. The browser client is ready for it once the server is deployed.</div>` : ''}
@@ -707,7 +784,7 @@ function setupView() {
       <div class="notice blue">For organisational deployment, server hosting, retention policy and access controls should be approved before broad staff rollout.</div>
     </section>
     <section class="card span12">
-      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age and learner persona.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !serverReady || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
+      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age and learner persona.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !state.serverConnected || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
     </section>
   </div>`;
 }
@@ -716,13 +793,13 @@ function interviewView() {
   const l = state.learner || {};
   const initial = (l.name || '?').slice(0, 1).toUpperCase();
   const liveControls = state.inputMode === 'live'
-    ? `<button class="btn ${state.liveListening ? 'danger' : 'primary'}" id="liveToggle" ${!state.learnerReady ? 'disabled' : ''}>${state.liveListening ? '■ Pause live listening' : '🎙️ Start live conversation'}</button><span class="badge">${state.speaking ? 'Learner speaking' : state.busy ? 'Learner thinking' : state.speechDetected ? 'Hearing you…' : state.liveListening ? 'Listening' : 'Paused'}</span>`
-    : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.learnerReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
+    ? `<button class="btn ${state.liveListening ? 'danger' : 'primary'}" id="liveToggle" ${!state.speechReady ? 'disabled' : ''}>${state.liveListening ? '■ Pause live listening' : '🎙️ Start live conversation'}</button><span class="badge">${state.speaking ? 'Learner speaking' : state.busy ? 'Learner thinking' : state.speechDetected ? 'Hearing you…' : state.liveListening ? 'Listening' : 'Paused'}</span>`
+    : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.speechReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
   return `<div class="grid"><section class="card span12">
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
-    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>Preparing learner AI…</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">The first cold start is prepared in the background; questions unlock automatically when the model is ready.</span></div>` : ''}
+    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>Preparing interview services…</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.</span></div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
-    <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.learnerReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.learnerReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode submits after ~0.9 seconds of silence.' : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
+    <div class="composer"><div class="btnRow">${liveControls}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><button class="btn ghost" id="stopAudio">Stop learner audio</button><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
 }
 
@@ -744,7 +821,7 @@ function resultsView() {
     <section class="card span12"><h3>Why this band?</h3><div class="threeCol"><div class="compare"><h4>Why not lower?</h4><p>${escapeHtml(l.distinguish.below)}</p></div><div class="compare"><h4>Best fit · ${escapeHtml(l.id)}</h4><p>${escapeHtml(l.summary)}</p></div><div class="compare"><h4>Why not higher?</h4><p>${escapeHtml(l.distinguish.above)}</p></div></div></section>
     <section class="card span7"><h3>Five spoken-performance dimensions</h3><div class="dimensions">${Object.entries(l.dimensions).map(([k,v]) => `<div class="dimension"><strong>${escapeHtml(cap(k))}</strong><span>${escapeHtml(v)}</span></div>`).join('')}</div></section>
     <section class="card span5"><h3>Your interviewing</h3><h4 style="margin-bottom:5px">What worked</h4><ul class="clean">${(r.strengths.length ? r.strengths : ['You completed enough interaction to make a level judgement.']).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul><h4 style="margin-bottom:5px">Next development</h4><ul class="clean">${r.developments.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>${state.sessionAudioUrl ? `<a class="btn secondary" href="${state.sessionAudioUrl}" download="tester-interview.webm" style="display:inline-block;text-decoration:none;margin-top:7px">Download tester microphone audio</a>` : '<div class="small">A microphone recording link appears here if you used the microphone during the interview.</div>'}</section>
-    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.rewritten_turns}</strong> automatically rewritten before display.</p>${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved contract warnings were detected in the displayed learner turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
+    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> turns showed a controlled grammatical/lexical limitation.</p>${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
     <section class="card span12"><h3>Central AI coach note</h3><p style="white-space:pre-wrap;color:var(--ink)">${escapeHtml(reveal.coach_note || 'No coach note generated.')}</p><div class="notice">Pronunciation is deliberately not scored yet. Transcript text alone cannot validly determine individual sounds, stress or prosody.</div></section>
     <section class="card span12"><div class="btnRow" style="justify-content:space-between"><button class="btn secondary" id="newSession">← New random learner</button><button class="btn" id="reviewTranscript">Show transcript</button></div><div id="resultTranscript" class="hidden" style="margin-top:15px"><div class="chat" style="max-height:420px">${state.transcript.map(turnHtml).join('')}</div></div></section>
   </div>`;
@@ -754,7 +831,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Modal Calibration Engine v0.9.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>CEFR Performance Engine v0.10.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
