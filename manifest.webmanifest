@@ -1,9 +1,9 @@
 {
-  "name": "CEFR Tester Trainer — Local Edition",
+  "name": "CEFR Tester Trainer — Central Server Edition",
   "short_name": "CEFR Trainer",
   "start_url": "./",
   "display": "standalone",
-  "background_color": "#f4f7fb",
+  "background_color": "#f3f6fa",
   "theme_color": "#142a4c",
-  "description": "Private, local CEFR English level-tester training simulator."
+  "description": "Browser-only CEFR tester training client connected to a central high-quality AI and speech server."
 }

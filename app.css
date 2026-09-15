@@ -44,7 +44,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .card h3 { margin:0 0 7px; font-size:18px; }
 .card p { color:var(--muted); line-height:1.55; margin:5px 0 14px; }
 .label { display:block; font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin-bottom:8px; }
-select, textarea, input[type=text] { width:100%; border:1px solid #ccd5e2; border-radius:12px; background:#fff; color:var(--ink); padding:12px 13px; outline:none; }
+select, textarea, input[type=text], input[type=password] { width:100%; border:1px solid #ccd5e2; border-radius:12px; background:#fff; color:var(--ink); padding:12px 13px; outline:none; }
 select:focus, textarea:focus, input:focus { border-color:var(--blue); box-shadow:0 0 0 3px rgba(47,111,237,.12); }
 .choiceRow { display:flex; flex-wrap:wrap; gap:10px; }
 .choice { border:1px solid var(--line); border-radius:13px; padding:10px 12px; background:#fff; color:var(--ink); }
