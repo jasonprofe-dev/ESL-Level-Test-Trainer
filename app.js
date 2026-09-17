@@ -884,7 +884,7 @@ function finishInterview() {
   render();
 }
 
-function analyzeInterview(actualLevel) {
+function analyzeInterview(actualLevel, backendTechnique = null) {
   const tester = state.transcript.filter(t => t.role === 'tester').map(t => t.text);
   const learner = state.transcript.filter(t => t.role === 'learner').map(t => t.text);
   const all = tester.join(' ').toLowerCase();
@@ -898,14 +898,15 @@ function analyzeInterview(actualLevel) {
     extended: /tell me about|describe|explain|what happened|how did/.test(all),
   };
   const coverageCount = Object.values(coverage).filter(Boolean).length;
-  const followStop = new Set(['about','after','again','because','could','doing','great','have','little','more','really','tell','that','their','there','these','thing','think','this','what','when','where','which','would','your','yourself','weekend','school']);
+  const followStop = new Set(['about','after','again','because','could','doing','great','have','like','little','more','really','tell','that','their','there','these','thing','think','this','what','when','where','which','would','your','yourself','weekend','school']);
   const contentWords = text => new Set(String(text || '').toLowerCase().match(/[a-z']{4,}/g)?.filter(w => !followStop.has(w)) || []);
   let followUps = 0;
   for (let i = 1; i < tester.length; i += 1) {
     const q = tester[i];
     const prior = learner[i - 1] || '';
     const explicitReference = /you (?:said|mentioned|told me)|you were saying|earlier you|tell me more about/i.test(q);
-    const qWords = contentWords(q);
+    const qProbe = String(q || '').split(/(?<=[.!])\s+/).slice(-1)[0].replace(/^\s*(?:now|anyway|moving on|let's move on)\b[:,]?\s*/i, '');
+    const qWords = contentWords(qProbe);
     const priorWords = contentWords(prior);
     const overlap = [...qWords].filter(w => priorWords.has(w));
     if (explicitReference || overlap.length >= 1 || /what happened next|why was that|how did that make you feel/i.test(q)) followUps += 1;
@@ -922,6 +923,11 @@ function analyzeInterview(actualLevel) {
     scaffolding: clamp(misunderstand ? 5 + scaffolds * 2 : 7 + Math.min(2, scaffolds), 1, 10),
     discrimination: clamp(Math.round(2 + [coverage.past, coverage.future, coverage.opinion, coverage.compare, coverage.hypothetical].filter(Boolean).length * 1.6), 1, 10),
   };
+  // v0.14.1: the server returns the same deterministic technique evidence used by
+  // the Central AI coach. Prefer it when present so the score cards and coach note
+  // cannot disagree about whether a genuine responsive follow-up occurred.
+  if (backendTechnique?.coverage) Object.assign(coverage, backendTechnique.coverage);
+  if (backendTechnique?.scores) Object.assign(scores, backendTechnique.scores);
   const distance = Math.abs(levelIndex(state.guess) - levelIndex(actualLevel));
   const verdict = distance === 0 ? 'Exact match' : distance === 1 ? 'Very close · one sub-level away' : distance <= 2 ? 'Close · one CEFR step or less away' : 'Calibration gap to review';
   const missing = Object.entries(coverage).filter(([, v]) => !v).map(([k]) => k);
@@ -930,7 +936,7 @@ function analyzeInterview(actualLevel) {
   if (scores.clarity >= 8) strengths.push('Questions were generally concise and easy to process.'); else developments.push('Shorten or split some questions so processing difficulty does not obscure language level.');
   if (scores.followUp >= 7) strengths.push('You used genuinely responsive follow-up questions linked to something the learner had just said.'); else developments.push('Add a genuinely responsive follow-up based on the learner’s own answer, not only the next planned diagnostic question.');
   if (scores.discrimination >= 8) strengths.push('You sampled several language functions that help distinguish adjacent bands.'); else developments.push('Probe more than familiar description: include past, future, opinion, comparison and an age-appropriate hypothetical.');
-  if (coverageCount >= 3 && scores.followUp < 7) strengths.push('You broadened the diagnostic demands across different question types, even though the progression was mainly planned rather than responsive.');
+  if (Object.values(coverage).filter(Boolean).length >= 3 && scores.followUp < 7) strengths.push('You broadened the diagnostic demands across different question types, even though the progression was mainly planned rather than responsive.');
   if (misunderstand && scaffolds) strengths.push('You showed evidence of reformulating when communication became difficult.');
   if (missing.length) developments.push(`Coverage still missing or weak: ${missing.join(', ')}.`);
   return { scores, coverage, distance, verdict, strengths, developments, questions: tester.length, turns: state.transcript.length };
@@ -949,7 +955,7 @@ async function submitGuess() {
     });
     if (!res.ok) throw new Error(await parseApiError(res));
     state.reveal = await res.json();
-    state.results = analyzeInterview(state.reveal.actual_level);
+    state.results = analyzeInterview(state.reveal.actual_level, state.reveal.tester_technique);
     state.stage = 'results';
   } catch (e) {
     state.error = `Could not generate debrief: ${e.message}`;
@@ -1085,7 +1091,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Performance Naturalness Engine v0.14.0</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Performance Naturalness Engine v0.14.1</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
