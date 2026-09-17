@@ -11,14 +11,14 @@ export const DIMENSIONS = ['range', 'accuracy', 'fluency', 'interaction', 'coher
 
 export const LEVELS = [
   {
-    id: 'A1.1', official: 'A1', phase: 'lower', ageMin: 7, ageMax: 14,
+    id: 'A1.1', official: 'A1', phase: 'lower', ageMin: 8, ageMax: 16,
     summary: 'Very early A1: relies on isolated words, memorised chunks and very short personal answers.',
     vocabulary: 'A very small bank of high-frequency words for self, family, school, colours, numbers, food and likes.',
     grammar: 'Mostly words and formulaic present-simple chunks. be/have/can, articles and basic word order are unstable.',
     discourse: 'Usually 1–4 words or one short clause; rarely links ideas beyond and/then.',
-    comprehension: 'Understands slow, concrete, familiar questions when wording is predictable; often needs repetition or simpler reformulation.',
-    fluency: 'Long searching pauses are normal; may abandon an answer or restart with a memorised chunk.',
-    interaction: 'Responds rather than initiates. Simple repair such as “Sorry?” or “I don’t know” is typical.',
+    comprehension: 'Understands only slow, concrete, highly familiar questions. Repetition, yes/no support or simpler reformulation is often needed, and some questions may not be understood at all.',
+    fluency: 'Single words, formulaic chunks and long searching pauses are normal; may abandon an answer, ask for repetition or say they do not know.',
+    interaction: 'Responds with substantial support. Repair such as “Sorry?”, “Again, please?” or “I don’t understand” is normal performance, not an exception.',
     errors: 'Basic errors are frequent and systematic; context often carries part of the meaning.',
     ceiling: 'Cannot sustain a simple past/future account or explain a reason beyond a memorised because + short phrase.',
     dimensions: {
@@ -28,7 +28,7 @@ export const LEVELS = [
       interaction: 'Simple personal questions/answers only; heavily dependent on repetition and rephrasing.',
       coherence: 'Words or groups of words linked mainly with and/then.'
     },
-    answerShape: { simple: '1–5 words', familiar: 'one short clause, sometimes two', stretch: 'fragment, misunderstanding or very short partial answer' },
+    answerShape: { simple: '1–5 words', familiar: 'one short clause, sometimes two with support', stretch: 'repair request, fragment, non-response or one very short partial idea' },
     canDo: ['give name/age/basic personal information', 'name likes/dislikes and familiar objects', 'answer highly predictable routine questions'],
     diagnosticTargets: [
       { skill: 'basic description', prompt: 'Describe your school/classroom or family.', expected: 'labels a few familiar things', ceilingSignal: 'cannot elaborate without heavy support' },
@@ -39,12 +39,12 @@ export const LEVELS = [
     distinguish: { below: 'No lower simulator band.', above: 'A1.2 can usually produce several short sentences and cope with a small follow-up without immediate breakdown.' }
   },
   {
-    id: 'A1.2', official: 'A1', phase: 'upper', ageMin: 7, ageMax: 15,
+    id: 'A1.2', official: 'A1', phase: 'upper', ageMin: 8, ageMax: 17,
     summary: 'Secure A1: can produce short simple sentences about immediate personal topics and survive brief predictable exchanges.',
     vocabulary: 'Basic everyday vocabulary with some school, hobby, routine, food and home language.',
     grammar: 'Simple present, can, there is/are and some memorised past/future chunks; accuracy remains uneven.',
     discourse: 'Several short clauses may be linked with and, but or because on a familiar topic.',
-    comprehension: 'Handles clear familiar questions but struggles when wording changes substantially or the idea becomes hypothetical.',
+    comprehension: 'Handles clear familiar questions, but changed wording, longer multi-part questions and past/hypothetical demands can require repetition or simplification.',
     fluency: 'Noticeable pauses, but can produce a few connected sentences on rehearsed/familiar content.',
     interaction: 'Can answer simple follow-ups and occasionally ask a basic question back.',
     errors: 'Frequent tense, article, preposition and third-person -s errors, generally without blocking basic meaning.',
@@ -56,7 +56,7 @@ export const LEVELS = [
       interaction: 'Can manage a brief predictable exchange and a simple follow-up with support.',
       coherence: 'Can connect a few simple ideas with and/but/because.'
     },
-    answerShape: { simple: 'one simple sentence', familiar: '2–4 short sentences', stretch: 'one partial idea plus hesitation/clarification' },
+    answerShape: { simple: 'one simple sentence', familiar: '1–3 short sentences', stretch: 'clarification request or one partial idea with hesitation' },
     canDo: ['describe routine and preferences simply', 'give one basic reason', 'produce a few memorised past/future expressions'],
     diagnosticTargets: [
       { skill: 'routine vs event', prompt: 'What do you usually do after school? What did you do yesterday?', expected: 'distinguishes routine more reliably than past event', ceilingSignal: 'past forms are sparse or unstable' },
@@ -67,14 +67,14 @@ export const LEVELS = [
     distinguish: { below: 'A1.1 is more dependent on isolated words/chunks and repetition.', above: 'A2.1 can sustain several linked sentences and manage straightforward past/future reference more productively.' }
   },
   {
-    id: 'A2.1', official: 'A2', phase: 'lower', ageMin: 8, ageMax: 16,
+    id: 'A2.1', official: 'A2', phase: 'lower', ageMin: 8, ageMax: 18,
     summary: 'Developing A2: manages short everyday exchanges and gives simple linked descriptions of familiar routines and events.',
     vocabulary: 'Enough for school, family, hobbies, shopping, holidays and basic feelings, with regular repetition.',
     grammar: 'Present forms are usable; past simple and basic future are emerging; subordinate clauses are limited.',
     discourse: 'Several short linked sentences using and, but, because, then and so.',
-    comprehension: 'Understands straightforward questions at clear conversational speed; abstract wording needs help.',
-    fluency: 'Can keep going on familiar topics despite frequent planning and reformulation.',
-    interaction: 'Can answer predictable follow-ups and repair simple misunderstandings.',
+    comprehension: 'Usually understands straightforward familiar questions, but abstract vocabulary, multi-part prompts and hypotheticals often need repetition, lexical clarification or simpler reformulation.',
+    fluency: 'Can keep going in short stretches on familiar topics, but frequent planning, restarts and occasional failure to formulate an answer remain plausible.',
+    interaction: 'Can answer predictable follow-ups, ask for repetition or word meaning, and respond better after appropriate scaffolding.',
     errors: 'Regular tense choice, irregular past, article and preposition errors; simple meaning remains clear.',
     ceiling: 'Opinions are brief and minimally justified; hypotheticals and multi-step comparison quickly expose limits.',
     dimensions: {
@@ -84,7 +84,7 @@ export const LEVELS = [
       interaction: 'Can answer questions and respond to simple statements; rarely drives the conversation.',
       coherence: 'Links groups of words/sentences with simple connectors such as and/but/because/then.'
     },
-    answerShape: { simple: '1–2 sentences', familiar: '3–5 short linked sentences', stretch: 'short simplified answer with visible searching' },
+    answerShape: { simple: '1–2 short sentences', familiar: '1–3 short linked sentences', stretch: 'brief simplified answer, clarification request or partial/non-response' },
     canDo: ['describe a routine and a recent event', 'give simple reasons and preferences', 'make basic plans/predictions'],
     diagnosticTargets: [
       { skill: 'short narrative', prompt: 'Tell me what happened last weekend from beginning to end.', expected: 'simple sequence with then/after', ceilingSignal: 'tense control and detail are fragile' },
@@ -95,14 +95,14 @@ export const LEVELS = [
     distinguish: { below: 'A1.2 usually relies more on rehearsed chunks and shorter answers.', above: 'A2.2 can maintain a short coherent account and paraphrase a missing everyday word more effectively.' }
   },
   {
-    id: 'A2.2', official: 'A2', phase: 'upper', ageMin: 9, ageMax: 17,
+    id: 'A2.2', official: 'A2', phase: 'upper', ageMin: 9, ageMax: 18,
     summary: 'Strong A2: sustains simple conversation on familiar matters and can give a short coherent account with reasons and sequencing.',
     vocabulary: 'Broader everyday vocabulary; can sometimes describe around a missing common word.',
     grammar: 'Uses present/past/future basics, comparatives and common modals; complex clause control is limited.',
     discourse: 'Produces short coherent accounts with sequencing, simple cause and basic contrast.',
-    comprehension: 'Usually follows familiar conversational questions without repetition; unfamiliar abstractions may require clarification.',
-    fluency: 'Generally continuous in short stretches, with obvious searching beyond familiar topics.',
-    interaction: 'Participates actively and can ask for clarification in simple language.',
+    comprehension: 'Usually follows familiar conversational questions without help, but long multi-part questions, unfamiliar abstractions and hypotheticals can still trigger clarification or repetition.',
+    fluency: 'Reasonably continuous in short familiar stretches; searching and reduced development become obvious when the task is less familiar or structurally demanding.',
+    interaction: 'Participates in simple conversation, can ask for clarification, and can recover when the tester repeats or simplifies a difficult question.',
     errors: 'Noticeable grammar errors remain, especially under pressure, but seldom cause misunderstanding.',
     ceiling: 'Limited subordinate-clause control and little nuance; difficult ideas are simplified rather than developed.',
     dimensions: {
@@ -112,7 +112,7 @@ export const LEVELS = [
       interaction: 'Can sustain a straightforward exchange and signal/repair misunderstanding.',
       coherence: 'Connects short sequences with a small but functional set of linking words.'
     },
-    answerShape: { simple: '2–3 sentences', familiar: '4–7 linked sentences', stretch: 'simplified 2–4 sentence response; may request clarification' },
+    answerShape: { simple: '1–2 concise sentences', familiar: '2–4 short linked sentences', stretch: '1–3 simplified sentences or a brief clarification request' },
     canDo: ['tell a simple story with sequence', 'compare familiar options', 'explain a preference with more than one reason', 'paraphrase a missing common word simply'],
     diagnosticTargets: [
       { skill: 'narrative detail', prompt: 'Tell me about a time something went wrong on a trip or at school.', expected: 'sequence + basic cause/result', ceilingSignal: 'little background, evaluation or complex time relation' },
@@ -123,7 +123,7 @@ export const LEVELS = [
     distinguish: { below: 'A2.1 is more fragmented and less reliable in short narratives.', above: 'B1.1 can sustain connected speech, narrate more independently and explain a viewpoint beyond a few simple reasons.' }
   },
   {
-    id: 'B1.1', official: 'B1', phase: 'lower', ageMin: 10, ageMax: 17,
+    id: 'B1.1', official: 'B1', phase: 'lower', ageMin: 10, ageMax: 18,
     summary: 'Early B1: maintains familiar conversation, narrates events and gives connected reasons, but complexity noticeably reduces control.',
     vocabulary: 'Functional range for everyday life, school and interests; circumlocution appears on less familiar topics.',
     grammar: 'Reasonable control of common tense contrasts, modals and first conditional; more complex forms are emerging.',
@@ -151,7 +151,7 @@ export const LEVELS = [
     distinguish: { below: 'A2.2 produces shorter, more concrete accounts and has less independent control of narrative/opinion.', above: 'B1.2 develops answers more flexibly, handles some hypothetical/inferential questions and keeps basic grammar more stable while taking risks.' }
   },
   {
-    id: 'B1.2', official: 'B1', phase: 'upper', ageMin: 11, ageMax: 17,
+    id: 'B1.2', official: 'B1', phase: 'upper', ageMin: 11, ageMax: 18,
     summary: 'Strong B1: fairly confident connected speech with reasons, organised narratives and emerging complex language.',
     vocabulary: 'Good everyday range plus some topic-specific vocabulary; paraphrase is often effective.',
     grammar: 'Common tense/aspect patterns are mostly controlled; relative clauses, conditionals and reported ideas appear with mixed accuracy.',
@@ -179,7 +179,7 @@ export const LEVELS = [
     distinguish: { below: 'B1.1 is more hesitant and linear with less stable complex language.', above: 'B2.1 shows more spontaneous detailed viewpoints, wider range and a fairly even tempo with fewer conspicuous planning pauses.' }
   },
   {
-    id: 'B2.1', official: 'B2', phase: 'lower', ageMin: 12, ageMax: 17,
+    id: 'B2.1', official: 'B2', phase: 'lower', ageMin: 12, ageMax: 18,
     summary: 'Early B2: spontaneous interaction and detailed viewpoints with clear emerging sophistication, but precision and control are not fully consistent.',
     vocabulary: 'Wide enough for many academic/social topics, with some collocation problems and occasional imprecision.',
     grammar: 'Good range of subordinate clauses, conditionals, passives and tense/aspect; errors remain noticeable in demanding stretches.',
@@ -207,7 +207,7 @@ export const LEVELS = [
     distinguish: { below: 'B1.2 has less even fluency and a narrower complex-language repertoire.', above: 'B2.2 is more consistently flexible, cohesive and controlled across abstract/hypothetical discussion.' }
   },
   {
-    id: 'B2.2', official: 'B2', phase: 'upper', ageMin: 12, ageMax: 17,
+    id: 'B2.2', official: 'B2', phase: 'upper', ageMin: 12, ageMax: 18,
     summary: 'Strong B2: sustained, flexible conversation with detailed argument and relatively high control across familiar and abstract topics.',
     vocabulary: 'Broad range with effective paraphrase and some idiomatic/collocational language; occasional awkward choices remain.',
     grammar: 'Wide structural range used spontaneously with good control; complex errors are occasional rather than dominant.',
@@ -235,7 +235,7 @@ export const LEVELS = [
     distinguish: { below: 'B2.1 is a little less consistent in cohesion, control and precision under pressure.', above: 'C1.1 maintains a high degree of accuracy and flexible expression with much less need to restrict or simplify what they want to say.' }
   },
   {
-    id: 'C1.1', official: 'C1', phase: 'lower', ageMin: 14, ageMax: 17,
+    id: 'C1.1', official: 'C1', phase: 'lower', ageMin: 14, ageMax: 18,
     summary: 'Early C1: fluent and flexible in extended abstract discussion, with occasional limits in precision, register or idiomatic naturalness.',
     vocabulary: 'Very broad range, including less common expressions; occasional searching or slightly awkward collocation can occur.',
     grammar: 'Wide and varied complex grammar with high accuracy; errors are infrequent and often self-corrected.',
@@ -263,7 +263,7 @@ export const LEVELS = [
     distinguish: { below: 'B2.2 is highly effective but shows more restriction/repetition and less consistently high grammatical control.', above: 'C1.2 is more consistently precise, natural and rhetorically controlled across unfamiliar or demanding topics.' }
   },
   {
-    id: 'C1.2', official: 'C1', phase: 'upper', ageMin: 14, ageMax: 17,
+    id: 'C1.2', official: 'C1', phase: 'upper', ageMin: 14, ageMax: 18,
     summary: 'Strong C1: highly fluent, precise and well organised across demanding topics with strong register and discourse control.',
     vocabulary: 'Extensive and flexible with strong collocation, paraphrase and register awareness.',
     grammar: 'Very wide range with consistently high control and natural variation.',
@@ -291,7 +291,7 @@ export const LEVELS = [
     distinguish: { below: 'C1.1 can show occasional precision/register limitations under demanding conditions.', above: 'C2.1 shows near-mastery: finer shades of meaning, idiomatic flexibility and almost invisible repair.' }
   },
   {
-    id: 'C2.1', official: 'C2', phase: 'lower', ageMin: 15, ageMax: 17,
+    id: 'C2.1', official: 'C2', phase: 'lower', ageMin: 15, ageMax: 18,
     summary: 'Near-mastery C2: exceptionally flexible, precise and nuanced communication with very few detectable limitations.',
     vocabulary: 'Extremely broad, precise and idiomatic, including subtle distinctions and register shifts.',
     grammar: 'Near-complete control of complex grammar, including marked and stylistically motivated structures.',
@@ -319,7 +319,7 @@ export const LEVELS = [
     distinguish: { below: 'C1.2 is highly advanced but less consistently idiomatic/fine-grained.', above: 'C2.2 is the simulator’s maximal band: practically no discernible language limitation in interview conditions.' }
   },
   {
-    id: 'C2.2', official: 'C2', phase: 'upper', ageMin: 15, ageMax: 17,
+    id: 'C2.2', official: 'C2', phase: 'upper', ageMin: 15, ageMax: 18,
     summary: 'Top simulator band: consistently precise, natural, nuanced and adaptable spoken English within ordinary interview conditions.',
     vocabulary: 'Extensive idiomatic, figurative and semantic precision with highly flexible register control.',
     grammar: 'Consistently effortless structural control with stylistic flexibility.',
