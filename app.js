@@ -29,6 +29,7 @@ const state = {
   speechReady: false,
   voiceReady: false,
   warmServices: {},
+  requiredServices: ['llm','stt','tts'],
   warmStatus: 'Not started',
   warmFailed: false,
   warmStartedAt: 0,
@@ -125,8 +126,9 @@ async function checkServer({ quiet = false } = {}) {
     state.textReady = !!data.text_ready;
     state.speechReady = !!data.speech_ready;
     state.voiceReady = !!data.voice_ready;
-    state.learnerReady = !!data.ready;
+    state.learnerReady = false;
     state.warmServices = data.services || {};
+    state.requiredServices = ['llm','stt','tts'];
     const anyWarming = Object.values(state.warmServices).some(s => s?.status === 'warming');
     state.serverStatus = state.textReady ? `Connected · ${data.model || 'AI service ready'}` : (anyWarming ? 'Server reachable · learner model warming' : 'Server reachable · AI starts when you select a learner');
     state.sttStatus = state.speechReady ? `Server speech recognition · ${data.whisper || 'Whisper'} ready` : (anyWarming ? `Server speech recognition · ${data.whisper || 'Whisper'} warming` : `Server speech recognition · ${data.whisper || 'Whisper'} starts with interview`);
@@ -209,7 +211,11 @@ async function startInterview() {
   state.warmFailed = false;
   render();
   try {
-    const res = await apiFetch('/api/session/start', { method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
+    const res = await apiFetch('/api/session/start', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ voice_mode: state.voiceMode, input_mode: state.inputMode }),
+    });
     if (!res.ok) throw new Error(await parseApiError(res));
     const data = await res.json();
     state.sessionId = data.session_id;
@@ -217,9 +223,10 @@ async function startInterview() {
     state.textReady = !!data.text_ready;
     state.speechReady = !!data.speech_ready;
     state.voiceReady = !!data.voice_ready;
-    state.learnerReady = state.textReady && state.speechReady && state.voiceReady;
+    state.requiredServices = data.required_services || ['llm','stt','tts'];
+    state.learnerReady = data.requested_ready ?? (state.textReady && state.speechReady && (!state.requiredServices.includes('tts') || state.voiceReady));
     state.warmServices = data.warm_services || {};
-    state.warmStatus = state.learnerReady ? 'All interview services ready' : 'Preparing interview services on Modal…';
+    state.warmStatus = state.learnerReady ? 'Required interview services ready' : 'Preparing required interview services on Modal…';
     state.warmStartedAt = Date.now();
     state.transcript = [];
     state.input = '';
@@ -267,7 +274,8 @@ async function pollLearnerReady() {
       state.textReady = !!data.text_ready;
       state.speechReady = !!data.speech_ready;
       state.voiceReady = !!data.voice_ready;
-      state.learnerReady = !!data.ready;
+      state.requiredServices = data.required_services || state.requiredServices || ['llm','stt','tts'];
+      state.learnerReady = data.requested_ready ?? !!data.ready;
       state.warmServices = data.services || {};
       if (state.textReady) startInterviewClock();
       const seconds = Math.max(0, Math.round((Date.now() - state.warmStartedAt) / 1000));
@@ -275,10 +283,11 @@ async function pollLearnerReady() {
         .filter(([, svc]) => svc?.status === 'error')
         .map(([name, svc]) => `${name.toUpperCase()}: ${String(svc?.error || 'startup failed')}`);
       state.warmFailed = serviceErrors.length > 0 || data.status === 'error';
+      const needsTts = state.requiredServices.includes('tts');
       const bits = [
         `AI ${state.warmServices?.llm?.status === 'error' ? '✕' : (state.textReady ? '✓' : '…')}`,
         `Whisper ${state.warmServices?.stt?.status === 'error' ? '✕' : (state.speechReady ? '✓' : '…')}`,
-        `Voice ${state.warmServices?.tts?.status === 'error' ? '✕' : (state.voiceReady ? '✓' : '…')}`,
+        `Voice ${needsTts ? (state.warmServices?.tts?.status === 'error' ? '✕' : (state.voiceReady ? '✓' : '…')) : '—'}`,
       ];
       state.warmStatus = `${bits.join(' · ')} · ${seconds}s`;
       if (serviceErrors.length) state.warmStatus += ` · ${serviceErrors.join(' | ')}`;
@@ -287,13 +296,13 @@ async function pollLearnerReady() {
       if (state.learnerReady) {
         clearInterval(warmPollTimer);
         warmPollTimer = null;
-        state.info = 'All interview services are ready.';
+        state.info = 'Required interview services are ready.';
       } else if (state.warmFailed) {
         clearInterval(warmPollTimer);
         warmPollTimer = null;
         state.info = '';
       } else if (state.textReady && !state.info) {
-        state.info = 'Learner AI is ready for typed questions while speech services finish warming.';
+        state.info = 'Learner AI is ready for typed questions while required speech services finish warming.';
       }
       render();
     } catch (e) {
@@ -315,16 +324,17 @@ async function retryWarmServices() {
   state.warmStatus = 'Retry requested…';
   render();
   try {
-    const res = await apiFetch('/api/warm/retry', { method: 'POST', headers: authHeaders() });
+    const res = await apiFetch(`/api/session/${encodeURIComponent(state.sessionId)}/warm/retry`, { method: 'POST', headers: authHeaders() });
     if (!res.ok) throw new Error(await parseApiError(res));
     const data = await res.json();
     state.warmServices = data.services || {};
+    state.requiredServices = data.required_services || state.requiredServices || ['llm','stt','tts'];
     state.textReady = !!data.text_ready;
     state.speechReady = !!data.speech_ready;
     state.voiceReady = !!data.voice_ready;
-    state.learnerReady = !!data.ready;
+    state.learnerReady = data.requested_ready ?? !!data.ready;
     if (state.learnerReady) {
-      state.info = 'All interview services are ready.';
+      state.info = 'Required interview services are ready.';
       render();
       return;
     }
@@ -362,7 +372,15 @@ async function askLearner(question) {
     const reply = String(data.reply || '').trim() || "Sorry, I'm not sure what to say.";
     const serverAiMs = Number(data.timings?.total_ai_ms || 0);
     const aiMs = performance.now() - aiStarted;
-    state.lastTurnTiming = { sttMs: state.lastSttMs, aiMs, serverAiMs, rewritten: !!data.rewritten };
+    state.lastTurnTiming = {
+      sttMs: state.lastSttMs, aiMs, serverAiMs,
+      modelMs: Number(data.timings?.model_ms || 0),
+      promptTokens: Number(data.timings?.prompt_tokens || 0),
+      generatedTokens: Number(data.timings?.generated_tokens || 0),
+      kernelMode: String(data.timings?.kernel_mode || ''),
+      responseShape: String(data.timings?.response_shape || 'normal'),
+      rewritten: !!data.rewritten,
+    };
     state.transcript.push({ role: 'learner', text: reply, at: Date.now() });
     state.busy = false;
     render(); scrollChat();
@@ -411,6 +429,10 @@ async function transcribeServer(blob, mimeType = 'audio/webm') {
         processingMs: Number(data.processing_ms || 0),
         wallMs: performance.now() - wallStarted,
         automaticSecondPass: !!data.automatic_second_pass,
+        initialRetryReason: String(data.initial_retry_reason || ''),
+        firstPassMs: Number(data.first_pass_ms || 0),
+        secondPassMs: Number(data.second_pass_ms || 0),
+        audioBytes: Number(data.audio_bytes || 0),
         clientRetry,
       };
     } catch (e) {
@@ -923,7 +945,7 @@ function analyzeInterview(actualLevel, backendTechnique = null) {
     scaffolding: clamp(misunderstand ? 5 + scaffolds * 2 : 7 + Math.min(2, scaffolds), 1, 10),
     discrimination: clamp(Math.round(2 + [coverage.past, coverage.future, coverage.opinion, coverage.compare, coverage.hypothetical].filter(Boolean).length * 1.6), 1, 10),
   };
-  // v0.14.4: the server returns the same deterministic technique evidence used by
+  // v0.14.5: the server returns the same deterministic technique evidence used by
   // the Central AI coach. Prefer it when present so the score cards and coach note
   // cannot disagree about whether a genuine responsive follow-up occurred.
   if (backendTechnique?.coverage) Object.assign(coverage, backendTechnique.coverage);
@@ -982,6 +1004,7 @@ async function newSession() {
   state.speechReady = false;
   state.voiceReady = false;
   state.warmServices = {};
+  state.requiredServices = ['llm','stt','tts'];
   state.warmStatus = 'Not started';
   state.transcript = [];
   state.pendingAudioBlob = null;
@@ -1047,7 +1070,7 @@ function setupView() {
       <div class="notice blue">For organisational deployment, server hosting, retention policy and access controls should be approved before broad staff rollout.</div>
     </section>
     <section class="card span12">
-      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age, European ESL background and learner persona. GPU services warm only when you start an interview to reduce Modal spend.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !state.serverConnected || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
+      <div class="btnRow" style="justify-content:space-between"><div><strong>Ready?</strong><div class="small">The server secretly selects one of 12 internal bands from A1.1 to C2.2, plus an age, European ESL background and learner persona. Only the services needed for your selected interview mode warm when you start, reducing Modal spend.</div></div><button class="btn primary big" id="startInterview" ${!state.authenticated || !state.serverConnected || state.busy ? 'disabled' : ''}>${state.busy ? '<span class="spinner"></span>Starting…' : 'Start random interview →'}</button></div>
     </section>
   </div>`;
 }
@@ -1060,9 +1083,9 @@ function interviewView() {
     : `<button class="mic ${state.recording ? 'recording' : ''}" id="micBtn" title="${state.recording ? 'Release to transcribe' : 'Press and hold to speak'}" ${state.busy || state.speaking || !state.speechReady ? 'disabled' : ''}>${state.recording ? '■' : '🎙️'}</button>`;
   return `<div class="grid"><section class="card span12">
     <div class="interviewHeader"><div class="student"><div class="avatar">${escapeHtml(initial)}</div><div><h2>${escapeHtml(l.name)}, ${escapeHtml(l.age)}</h2><p>${l.gender === 'boy' ? 'Boy' : 'Girl'} · ${escapeHtml(l.personalityHint || '')} · ${escapeHtml([l.city,l.country].filter(Boolean).join(', '))} · hidden level</p></div></div><div><div class="timer" id="timer">${formatClock(state.elapsed)}</div><div class="small">${state.transcript.filter(t => t.role === 'tester').length} questions</div></div></div>
-    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro voice warms independently, so one slower service no longer blocks everything.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
+    <div class="notice blue">Conduct the interview naturally. The target CEFR band lives on the server and is not sent to this browser until you submit your guess.</div>${!state.learnerReady ? `<div class="notice" style="margin-top:10px"><strong>${state.warmFailed ? 'A service failed to start.' : 'Preparing interview services…'}</strong> ${escapeHtml(state.warmStatus)}<br><span class="small">${state.warmFailed ? 'Automatic polling has stopped, so the app will not repeatedly re-launch failed Modal calls.' : 'Typed questions unlock as soon as AI is ✓. Microphone unlocks when Whisper is ✓. Kokoro only warms when Central voice is selected; Browser voice and No audio avoid that backend cost.'}</span>${state.warmFailed ? '<div style="margin-top:10px"><button class="btn secondary" id="retryWarm">Retry services once</button></div>' : ''}</div>` : ''}
     <div class="chat" id="chat">${state.transcript.length ? state.transcript.map(turnHtml).join('') : '<div class="small" style="text-align:center;padding:70px 10px">Begin with your first level-test question.</div>'}${state.busy ? '<div class="turn learner"><div class="bubble"><div class="who">Learner</div><span class="spinner" style="border-color:#c9d7eb;border-top-color:#2f6fed"></span>Preparing an answer…</div></div>' : ''}</div>
-    <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><div class="btnRow"><button class="btn ghost" id="stopAudio">Stop learner audio</button>${state.pendingVoiceText ? `<button class="btn secondary" id="retryVoice">Retry learner voice</button>` : ''}</div><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
+    <div class="composer"><div class="btnRow">${liveControls}${state.pendingAudioBlob ? `<button class="btn secondary" id="retryTranscription">Retry last transcription</button><span class="badge">Audio retained</span>` : ''}</div><div class="inputLine" style="grid-template-columns:1fr auto"><input id="questionInput" type="text" value="${escapeHtml(state.input)}" placeholder="You can type a question at any time…" ${state.busy || !state.textReady ? 'disabled' : ''}/><button class="btn primary send" id="sendQuestion" ${state.busy || !state.textReady ? 'disabled' : ''}>Ask</button></div><div class="small">${escapeHtml(state.sttStatus)}${state.pendingAudioBlob && state.pendingAudioLabel ? ` · ${escapeHtml(state.pendingAudioLabel)}` : ''}${state.inputMode === 'live' && state.liveListening ? ' · Live mode waits ~1.85 seconds of silence so natural pauses are less likely to cut a question short.' : ''}${state.lastTurnTiming ? ` · Last AI: ${(state.lastTurnTiming.aiMs / 1000).toFixed(1)}s${state.lastTurnTiming.modelMs ? ` (model ${(state.lastTurnTiming.modelMs / 1000).toFixed(1)}s · ${state.lastTurnTiming.promptTokens}→${state.lastTurnTiming.generatedTokens} tok)` : ''}` : ''}${state.lastSttMs ? ` · STT: ${(state.lastSttMs / 1000).toFixed(1)}s${state.lastSttSecondPass ? ' (accuracy retry)' : ''}` : ''}${state.lastTtsMs ? ` · Voice starts: ${(state.lastTtsMs / 1000).toFixed(1)}s` : ''}</div><div class="btnRow" style="justify-content:space-between"><div class="btnRow"><button class="btn ghost" id="stopAudio">Stop learner audio</button>${state.pendingVoiceText ? `<button class="btn secondary" id="retryVoice">Retry learner voice</button>` : ''}</div><button class="btn" id="finishInterview">Finish interview & guess level</button></div></div>
   </section></div>`;
 }
 
@@ -1084,7 +1107,7 @@ function resultsView() {
     <section class="card span12"><h3>Why this band?</h3><div class="threeCol"><div class="compare"><h4>Why not lower?</h4><p>${escapeHtml(l.distinguish.below)}</p></div><div class="compare"><h4>Best fit · ${escapeHtml(l.id)}</h4><p>${escapeHtml(l.summary)}</p></div><div class="compare"><h4>Why not higher?</h4><p>${escapeHtml(l.distinguish.above)}</p></div></div></section>
     <section class="card span7"><h3>Five spoken-performance dimensions</h3><div class="dimensions">${Object.entries(l.dimensions).map(([k,v]) => `<div class="dimension"><strong>${escapeHtml(cap(k))}</strong><span>${escapeHtml(v)}</span></div>`).join('')}</div></section>
     <section class="card span5"><h3>Your interviewing</h3><h4 style="margin-bottom:5px">What worked</h4><ul class="clean">${(r.strengths.length ? r.strengths : ['You completed enough interaction to make a level judgement.']).map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul><h4 style="margin-bottom:5px">Next development</h4><ul class="clean">${r.developments.map(x => `<li>${escapeHtml(x)}</li>`).join('')}</ul>${state.sessionAudioUrl ? `<a class="btn secondary" href="${state.sessionAudioUrl}" download="tester-interview.webm" style="display:inline-block;text-decoration:none;margin-top:7px">Download tester microphone audio</a>` : '<div class="small">A microphone recording link appears here if you used the microphone during the interview.</div>'}</section>
-    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> showed a controlled grammatical/lexical limitation${reveal.calibration_report.turns_with_planning_signals ? ` · <strong>${reveal.calibration_report.turns_with_planning_signals}</strong> showed planning/searching` : ''}${reveal.calibration_report.turns_with_brevity_pressure ? ` · <strong>${reveal.calibration_report.turns_with_brevity_pressure}</strong> showed shorter development under pressure` : ''}${reveal.calibration_report.turns_with_comprehension_breakdown ? ` · <strong>${reveal.calibration_report.turns_with_comprehension_breakdown}</strong> showed a receptive comprehension/repair event` : ''}${reveal.calibration_report.turns_with_production_breakdown ? ` · <strong>${reveal.calibration_report.turns_with_production_breakdown}</strong> showed a formulation/non-response event` : ''}${reveal.calibration_report.turns_with_partial_comprehension ? ` · <strong>${reveal.calibration_report.turns_with_partial_comprehension}</strong> answered only the accessible part of a multi-part prompt` : ''}${reveal.calibration_report.scaffolded_recovery_turns ? ` · <strong>${reveal.calibration_report.scaffolded_recovery_turns}</strong> recovered after tester scaffolding` : ''}${reveal.calibration_report.average_learner_words ? ` · avg. <strong>${reveal.calibration_report.average_learner_words}</strong> words/answer` : ''}${reveal.calibration_report.drift_guard_turns ? ` · performance-drift guard active on <strong>${reveal.calibration_report.drift_guard_turns}</strong> turn(s)` : ''}${reveal.calibration_report.naturalness_gate_forced_turns ? ` · naturalness gate intervened on <strong>${reveal.calibration_report.naturalness_gate_forced_turns}</strong>` : ''}${reveal.calibration_report.age_adjustment_turns ? ` · <strong>${reveal.calibration_report.age_adjustment_turns}</strong> turn(s) needed life-stage grounding` : ''}.</p>${(reveal.calibration_report.hard_gate_failures || reveal.calibration_report.naturalness_gate_failures) ? `<div class="notice"><strong>Simulation fidelity warning:</strong> ${Number(reveal.calibration_report.hard_gate_failures || 0) + Number(reveal.calibration_report.naturalness_gate_failures || 0)} performance-contract check(s) could not be fully realised after deterministic control. Treat this attempt cautiously for standardisation.</div>` : ''}${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.limitation_routes?.length ? `<div class="notice blue"><strong>Diagnostic routes used:</strong> ${escapeHtml(reveal.calibration_report.limitation_routes.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
+    <section class="card span12"><h3>Calibration engine</h3>${reveal.calibration_report ? `<p><strong>${reveal.calibration_report.turns_checked}</strong> learner turns checked · <strong>${reveal.calibration_report.turns_with_spoken_form_limits || 0}</strong> showed a controlled grammatical/lexical limitation${reveal.calibration_report.turns_with_planning_signals ? ` · <strong>${reveal.calibration_report.turns_with_planning_signals}</strong> showed planning/searching` : ''}${reveal.calibration_report.turns_with_brevity_pressure ? ` · <strong>${reveal.calibration_report.turns_with_brevity_pressure}</strong> showed shorter development under pressure` : ''}${reveal.calibration_report.turns_with_comprehension_breakdown ? ` · <strong>${reveal.calibration_report.turns_with_comprehension_breakdown}</strong> showed a receptive comprehension/repair event` : ''}${reveal.calibration_report.turns_with_production_breakdown ? ` · <strong>${reveal.calibration_report.turns_with_production_breakdown}</strong> showed a formulation/non-response event` : ''}${reveal.calibration_report.turns_with_partial_comprehension ? ` · <strong>${reveal.calibration_report.turns_with_partial_comprehension}</strong> answered only the accessible part of a multi-part prompt` : ''}${reveal.calibration_report.scaffolded_recovery_turns ? ` · <strong>${reveal.calibration_report.scaffolded_recovery_turns}</strong> recovered after tester scaffolding` : ''}${reveal.calibration_report.average_learner_words ? ` · avg. <strong>${reveal.calibration_report.average_learner_words}</strong> words/answer` : ''}${reveal.calibration_report.drift_guard_turns ? ` · performance-drift guard active on <strong>${reveal.calibration_report.drift_guard_turns}</strong> turn(s)` : ''}${reveal.calibration_report.naturalness_gate_forced_turns ? ` · naturalness gate intervened on <strong>${reveal.calibration_report.naturalness_gate_forced_turns}</strong>` : ''}${reveal.calibration_report.age_adjustment_turns ? ` · <strong>${reveal.calibration_report.age_adjustment_turns}</strong> turn(s) needed life-stage grounding` : ''}.</p>${(reveal.calibration_report.hard_gate_failures || reveal.calibration_report.naturalness_gate_failures) ? `<div class="notice"><strong>Simulation fidelity warning:</strong> ${Number(reveal.calibration_report.hard_gate_failures || 0) + Number(reveal.calibration_report.naturalness_gate_failures || 0)} performance-contract check(s) could not be fully realised after deterministic control. Treat this attempt cautiously for standardisation.</div>` : ''}${reveal.calibration_report.realised_signatures?.length ? `<div class="notice blue"><strong>Realised learner signatures:</strong> ${escapeHtml(reveal.calibration_report.realised_signatures.join(' · '))}</div>` : ''}${reveal.calibration_report.realised_error_codes && Object.keys(reveal.calibration_report.realised_error_codes).length ? `<div class="notice blue"><strong>Error-code spread:</strong> ${escapeHtml(Object.entries(reveal.calibration_report.realised_error_codes).map(([k,v]) => `${k} ×${v}`).join(' · '))}</div>` : ''}${reveal.calibration_report.response_shapes && Object.keys(reveal.calibration_report.response_shapes).length ? `<div class="notice blue"><strong>Response shapes:</strong> ${escapeHtml(Object.entries(reveal.calibration_report.response_shapes).map(([k,v]) => `${k} ×${v}`).join(' · '))}</div>` : ''}${reveal.calibration_report.average_prompt_tokens ? `<div class="notice blue"><strong>Efficiency telemetry:</strong> avg. ${escapeHtml(reveal.calibration_report.average_prompt_tokens)} prompt tokens → ${escapeHtml(reveal.calibration_report.average_generated_tokens || 0)} generated · model ${escapeHtml(((reveal.calibration_report.average_model_ms || 0)/1000).toFixed(2))}s · total AI ${escapeHtml(((reveal.calibration_report.average_total_ai_ms || 0)/1000).toFixed(2))}s${reveal.calibration_report.kernel_modes ? ` · ${escapeHtml(Object.entries(reveal.calibration_report.kernel_modes).map(([k,v]) => `${k} ×${v}`).join(' / '))}` : ''}.</div>` : ''}${reveal.calibration_report.limitation_routes?.length ? `<div class="notice blue"><strong>Diagnostic routes used:</strong> ${escapeHtml(reveal.calibration_report.limitation_routes.join(' · '))}</div>` : ''}${reveal.calibration_report.unresolved_warnings?.length ? `<div class="notice"><strong>Residual calibration warnings:</strong> ${escapeHtml(reveal.calibration_report.unresolved_warnings.join(' · '))}</div>` : `<div class="notice ok">No unresolved performance-contract warnings were detected in the displayed turns.</div>`}` : '<p class="small">Calibration telemetry unavailable for this session.</p>'}</section>
     <section class="card span12"><h3>Central AI coach note</h3><p style="white-space:pre-wrap;color:var(--ink)">${escapeHtml(reveal.coach_note || 'No coach note generated.')}</p><div class="notice">Pronunciation is deliberately not scored yet. Transcript text alone cannot validly determine individual sounds, stress or prosody.</div></section>
     <section class="card span12"><div class="btnRow" style="justify-content:space-between"><button class="btn secondary" id="newSession">← New random learner</button><button class="btn" id="reviewTranscript">Show transcript</button></div><div id="resultTranscript" class="hidden" style="margin-top:15px"><div class="chat" style="max-height:420px">${state.transcript.map(turnHtml).join('')}</div></div></section>
   </div>`;
@@ -1094,7 +1117,7 @@ function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function scoreHtml(label, value) { return `<div class="score"><span class="small">${label}</span><strong>${value}/10</strong><div class="metric"><span style="width:${value * 10}%"></span></div></div>`; }
 
 function chrome() {
-  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Performance Naturalness Engine v0.14.4</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
+  return `<div class="shell"><header class="topbar"><div class="brand"><div class="logo">CT</div><div><h1>CEFR Tester Trainer</h1><small>Natural Conversation & Efficiency Engine v0.14.5</small></div></div><div class="pills"><span class="pill ${state.serverConnected ? 'ok' : 'warn'}">${state.serverConnected ? '● Server online' : '○ Server'}</span><span class="pill ${state.authenticated ? 'ok' : 'warn'}">${state.authenticated ? '● Trainer connected' : '○ Sign-in'}</span><span class="pill ok">No client install</span></div></header>${state.error ? `<div class="notice" style="border-color:#f1b8b4;background:#fff1f0;color:#8d251f;margin-bottom:14px"><strong>Problem:</strong> ${escapeHtml(state.error)}</div>` : ''}${state.info ? `<div class="notice ok" style="margin-bottom:14px">${escapeHtml(state.info)}</div>` : ''}${state.stage === 'setup' ? setupView() : state.stage === 'interview' ? interviewView() : state.stage === 'guess' ? guessView() : resultsView()}<div class="footerNote">Modal Serverless Edition: work devices require only an approved browser, microphone permission and HTTPS access to the GitHub site plus the central API. Learner AI and speech processing run on the server.</div></div>`;
 }
 
 function render() { app.innerHTML = chrome(); bind(); }
